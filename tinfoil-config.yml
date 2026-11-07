@@ -1,0 +1,56 @@
+# Fount Mail vault: holds the keyset in enclave memory and hands it only to
+# verified vaults and edges. See README.md. Everything here is measured, so every
+# value is public, and changing one takes a new release.
+cvm-version: 0.14.17 # https://github.com/tinfoilsh/cvmimage/releases/latest, no `v`
+cpus: 2
+memory: 4096
+
+attested-keys:
+  - id: transfer # x25519: keysets, shares, and imports are sealed to this
+    key: x25519
+
+networks:
+  # A vault only calls the other vault. Edges call in, and verification does no
+  # network I/O, so nothing else is reachable.
+  peers:
+    egress: allowlist
+    allow:
+      - vault-a.fount.containers.tinfoil.dev
+      - vault-b.fount.containers.tinfoil.dev
+
+containers:
+  - name: vault
+    image: "ghcr.io/fount-labs/fount-mail-vault@sha256:PLACEHOLDER_DIGEST" # from Build Image
+    networks: [peers]
+    keys: [transfer]
+    attestation: true
+    restart: always
+    healthcheck:
+      test: ["CMD", "/vault", "health"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 1m
+    ports: ["8080:8080"]
+    env:
+      - VAULT_REPO: "fount-labs/fount-mail-vault"
+      - EDGE_REPO: "fount-labs/fount-mail-edge"
+      - EDGE_MIN_TAG: "v0.1.0" # raise to retire old edge releases
+      - KEYSET_COMMITMENT: "" # empty only in the release that generates; see README
+      - VAULT_PEERS: "vault-a.fount.containers.tinfoil.dev,vault-b.fount.containers.tinfoil.dev"
+      - RECOVERY_RECIPIENTS: "PLACEHOLDER_AGE_RECIPIENTS" # comma-separated age1... keys, held offline
+      - RECOVERY_THRESHOLD: "1"
+      - OPERATOR_KEY: "PLACEHOLDER_OPERATOR_KEY" # from vaultctl operator-keygen
+
+shim:
+  upstream-port: 8080
+  paths:
+    - /health
+    - /status
+    - /generate
+    - /transfer/begin
+    - /transfer/finish
+    - /recovery/bundle
+    - /recovery/share
+    - /operator/begin
+    - /operator/import

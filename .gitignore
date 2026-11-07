@@ -1,0 +1,4 @@
+/vault
+/vaultctl
+*.bundle.json
+operator.key
