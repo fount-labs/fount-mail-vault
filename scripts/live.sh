@@ -10,7 +10,7 @@
 #   scripts/live.sh upgrade-a                 vault-a to v0.1.2 through a held candidate
 #   scripts/live.sh deploy-b                  vault-b from v0.1.2, pulling from vault-a
 #   scripts/live.sh import-s3                 S3 credentials into both vaults
-#   scripts/live.sh edge ABUSE.json POSTMASTER.json
+#   scripts/live.sh edge [ABUSE.json POSTMASTER.json]
 #                                             deploy the edge, init routing, add role mailboxes
 #   scripts/live.sh status                    everything at once, including the shared-host check
 #
@@ -179,7 +179,7 @@ case "${1:-}" in
     ;;
 
   edge)
-    (($# == 3)) || fail "usage: edge ABUSE.json POSTMASTER.json (each mailbox's public keys)"
+    (($# == 1 || $# == 3)) || fail "usage: edge [ABUSE.json POSTMASTER.json] (each role mailbox's public keys)"
     need_release "$EDGE_REPO" "$EDGE_TAG"
     step "deploying the edge from $EDGE_TAG"
     tinfoil container create edge --repo "$EDGE_REPO" --tag "$EDGE_TAG"
@@ -198,6 +198,10 @@ case "${1:-}" in
       sleep 5
     done
     pass "the edge is serving"
+    if (($# == 1)); then
+      echo "abuse@ and postmaster@ aren't provisioned; run edgectl provision before mail can arrive"
+      exit 0
+    fi
     edgectl provision -edge "$e" -operator-key "$OPERATOR_KEY_FILE" -role abuse -keys "$2"
     edgectl provision -edge "$e" -operator-key "$OPERATOR_KEY_FILE" -role postmaster -keys "$3"
     pass "abuse@ and postmaster@ provisioned"
