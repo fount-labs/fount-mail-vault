@@ -38,9 +38,9 @@ containers:
       - EDGE_MIN_TAG: "v0.1.0" # raise to retire old edge releases
       - KEYSET_COMMITMENT: "" # empty only in the release that generates; see README
       - VAULT_PEERS: "vault-a.fount.containers.tinfoil.dev,vault-b.fount.containers.tinfoil.dev"
-      - RECOVERY_RECIPIENTS: "PLACEHOLDER_AGE_RECIPIENTS" # comma-separated age1... keys, held offline
+      - RECOVERY_RECIPIENTS: "age1fuy00zm6yjuygfxxng6tsnugy2qkc0qdsfqcxer2p3um6u2a347slrf550,age1w8709c8vfnrevkmlz75n34n074elz4tgv220jx9vlf4qfsu3ruksaelxer" # comma-separated age1... keys, held offline
       - RECOVERY_THRESHOLD: "1"
-      - OPERATOR_KEY: "PLACEHOLDER_OPERATOR_KEY" # from vaultctl operator-keygen
+      - OPERATOR_KEY: "6b8cebf9ea0a064955b8673b49d715d70be2265b89c025b483a8e8ceec4ae986" # from vaultctl operator-keygen
 
 shim:
   upstream-port: 8080
