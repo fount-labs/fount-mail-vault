@@ -45,7 +45,8 @@ missing or malformed.
 
 ## Bootstrap
 
-Do this once.
+Do this once. `scripts/live.sh` runs each step below and checks it before the next; it
+creates Tinfoil containers but leaves every GitHub push and release to you.
 
 1. Make the keys, following `docs/KEYS.md`: one recovery identity per shareholder, made
    offline with `vaultctl recovery-keygen`, and the operator key.

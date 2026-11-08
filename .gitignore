@@ -2,3 +2,4 @@
 /vaultctl
 *.bundle.json
 operator.key
+/.live-state
