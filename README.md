@@ -66,14 +66,22 @@ creates Tinfoil containers but leaves every GitHub push and release to you.
 
 `v0.1.0` can never get the keys back, because every later release is above it.
 
+## Repos and releases
+
+This repo and `fount-labs/fount-mail-edge` are public, so anyone can rebuild a release and compare
+it with what runs. A ruleset on each makes `v*` tags creatable only by org admins, and permanent
+once pushed. Whoever can release can get the keys, so `docs/KEYS.md` lists the accounts that
+need hardware keys.
+
 ## Routine work
 
 - **Upgrading a vault.** Release, then update one vault with `--hold=true`, wait for the
   candidate's `has_keyset`, and promote. Then do the other.
 - **Rolling back.** Roll forward instead: release the old code under a new tag. A lower tag would
   be refused.
-- **Watching.** `/status` shows `freshness_expires_at`, from an hourly self-check. Alert when it's
-  under two days away, or when `refusals` grows.
+- **Watching.** `/status` shows `freshness_expires_at`, from an hourly self-check, plus
+  `refusals`, `chip_id`, and `same_chip_as_last_peer`. `fount-infra`'s `MailWatchStack` reads it
+  every 15 minutes and emails on problems, and on every new release of either repo.
 
 ## Full recovery
 

@@ -87,6 +87,25 @@ These three values go into the configs, and they're safe to paste anywhere:
   comma-separated, with `RECOVERY_THRESHOLD: "1"`;
 - the operator hex, as `OPERATOR_KEY` in this repo's config and in the edge's.
 
+## The accounts are keys too
+
+Some accounts can't read a key, but they can get a release made or mail redirected, and that
+amounts to the same thing. Put two hardware security keys on each, and remove SMS as a
+second factor:
+
+| Account | Why it matters |
+|---|---|
+| GitHub (`fount-labs`, and the admin's own account) | A vault hands the keyset to any release of the vault or edge repo at or above its minimum tag, whoever's Tinfoil account runs it. Whoever can release can get the keys |
+| The email account behind every other login | It resets the passwords for everything else on this list |
+| The DNS for `fountbox.com` | Pointing MX elsewhere and getting a certificate for it would let someone read new mail as it arrives |
+| AWS `fount-mail-prod` (root and any users) | Can delete mail, and overwrite routing backups that are past their retention. Sees only ciphertext |
+| Tinfoil | Can stop or delete the enclaves, which forces a recovery from shares. Can't read the keys |
+| Bitwarden, if it holds a recovery copy | Opens that identity |
+
+Releases are public, and `fount-infra`'s mail watcher emails on every one, so a release you
+didn't make shows up within 15 minutes. That's detection, not prevention. Preventing it takes
+the outside custodian below.
+
 ## Later: an outside custodian
 
 To stop a malicious Fount, not just stolen credentials, the custodian runs step 2 on
