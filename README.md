@@ -50,8 +50,8 @@ creates Tinfoil containers but leaves every GitHub push and release to you.
 
 1. Make the keys, following `docs/KEYS.md`: one recovery identity per shareholder, made
    offline with `vaultctl recovery-keygen`, and the operator key.
-2. Fill in `RECOVERY_RECIPIENTS`, `OPERATOR_KEY`, and the image digest, then release `v0.1.0`
-   with an empty commitment.
+2. Fill in `RECOVERY_RECIPIENTS` and `OPERATOR_KEY`. Run *Build Image* and pin the digest it
+   reports, then release `v0.1.0` with an empty commitment.
 3. Deploy `vault-a` from `v0.1.0`, and run `curl -X POST https://vault-a.../generate`. It answers
    with the commitment.
 4. Run `vaultctl bundle -vault vault-a... -out keyset.bundle.json`, then `vaultctl check-bundle`
@@ -72,6 +72,12 @@ This repo and `fount-labs/fount-mail-edge` are public, so anyone can rebuild a r
 it with what runs. A ruleset on each makes `v*` tags creatable only by org admins, and permanent
 once pushed. Whoever can release can get the keys, so `docs/KEYS.md` lists the accounts that
 need hardware keys.
+
+To release: run *Build Image* from `main`, pin the digest it reports in `tinfoil-config.yml`,
+commit, then `git tag vX.Y.Z && git push origin vX.Y.Z`. The tag push runs *Tinfoil Release*,
+which checks the tag is on `main` and the config has no placeholders, then measures, publishes,
+and marks the release latest so its witness renews. The pushed image is the output of
+`scripts/build-image.sh`, which CI builds on two runners and requires to match.
 
 ## Routine work
 

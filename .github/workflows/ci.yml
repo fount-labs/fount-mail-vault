@@ -1,0 +1,55 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+          cache: false
+      - run: go vet ./...
+      - run: go test -race ./...
+      - run: go test -race ./...
+        working-directory: wire
+
+  # Build the image on two runners and fail if the digests differ, so a release
+  # is one anyone can rebuild and match.
+  reproducible-build:
+    strategy:
+      matrix:
+        runner: [ubuntu-latest, ubuntu-24.04]
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+      - run: ./scripts/build-image.sh /tmp/vault.oci
+      - run: jq -r '.manifests[0].digest' /tmp/vault.oci/index.json | tee "digest-${{ matrix.runner }}.txt"
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: digest-${{ matrix.runner }}
+          path: digest-${{ matrix.runner }}.txt
+
+  compare-digests:
+    needs: reproducible-build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          pattern: digest-*
+          merge-multiple: true
+      - run: |
+          cat digest-*.txt
+          if [ "$(sort -u digest-*.txt | wc -l)" != "1" ]; then
+            echo "::error::Image digests differ across runners"
+            exit 1
+          fi
