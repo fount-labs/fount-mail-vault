@@ -33,6 +33,7 @@ const usage = `vaultctl <command> [flags]
   submit-share    -vault HOST -tag vX.Y.Z -bundle FILE -identity FILE
   import-s3       -vault HOST -tag vX.Y.Z -operator-key FILE   (reads AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY)
   operator-keygen -out FILE
+  recovery-keygen -out FILE   (an age identity for one shareholder; run it offline)
 `
 
 type multi []string
@@ -70,6 +71,8 @@ func main() {
 		err = importS3(ctx, client(*host, *repo, *tag), *operatorKey)
 	case "operator-keygen":
 		err = operatorKeygen(*out)
+	case "recovery-keygen":
+		err = recoveryKeygen(*out)
 	default:
 		fmt.Fprint(os.Stderr, usage)
 		os.Exit(2)
@@ -261,6 +264,30 @@ func operatorKeygen(out string) error {
 	}
 	pub := ed25519.NewKeyFromSeed(seed).Public().(ed25519.PublicKey)
 	fmt.Printf("wrote %s\nOPERATOR_KEY: %s\n", out, hex.EncodeToString(pub))
+	return nil
+}
+
+// recoveryKeygen writes an age identity in age-keygen's format, so the shareholder
+// needs only this binary on the offline machine. It prints only the recipient.
+func recoveryKeygen(out string) error {
+	if out == "" {
+		return errors.New("-out is required")
+	}
+	id, err := age.GenerateX25519Identity()
+	if err != nil {
+		return err
+	}
+	f, err := os.OpenFile(out, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+	recipient := id.Recipient().String()
+	_, err = fmt.Fprintf(f, "# created: %s\n# public key: %s\n%s\n", time.Now().UTC().Format(time.RFC3339), recipient, id)
+	if err != nil {
+		return err
+	}
+	fmt.Printf("wrote %s\nRECOVERY_RECIPIENT: %s\n", out, recipient)
 	return nil
 }
 

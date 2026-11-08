@@ -47,9 +47,8 @@ missing or malformed.
 
 Do this once.
 
-1. Make the offline identities. Run `age-keygen` on an offline machine, once per recipient, and
-   keep each identity somewhere separate. Run `vaultctl operator-keygen -out operator.key`, and
-   keep the key off AWS.
+1. Make the keys, following `docs/KEYS.md`: one recovery identity per shareholder, made
+   offline with `vaultctl recovery-keygen`, and the operator key.
 2. Fill in `RECOVERY_RECIPIENTS`, `OPERATOR_KEY`, and the image digest, then release `v0.1.0`
    with an empty commitment.
 3. Deploy `vault-a` from `v0.1.0`, and run `curl -X POST https://vault-a.../generate`. It answers
@@ -60,7 +59,9 @@ Do this once.
    `tinfoil container update vault-a --tag v0.1.1 --hold=true`. The candidate pulls from
    production by itself. Check its `/status` on port 4443, then promote.
 6. Deploy `vault-b` from `v0.1.1`, and import the S3 credentials with `vaultctl import-s3`.
-7. Release the edge with the same commitment.
+7. Release the edge with the same commitment and `OPERATOR_KEY`. Its first boot waits for
+   `edgectl init`, then add `abuse@` and `postmaster@` with `edgectl provision`. The edge's
+   `docs/BUILD.md` has the commands.
 
 `v0.1.0` can never get the keys back, because every later release is above it.
 
