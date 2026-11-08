@@ -33,6 +33,7 @@ const (
 // from the pinned repo.
 type world struct {
 	releases map[string]map[string]release // pin, then name
+	chips    map[string]string             // name to machine; unset means "machine-1"
 }
 
 type release struct {
@@ -55,7 +56,11 @@ func (w *world) Verify(doc, nonce []byte, pin string) (*attest.Peer, error) {
 	if !ok {
 		return nil, fmt.Errorf("%s isn't a release of %s", name, pin)
 	}
-	return &attest.Peer{Key: r.key, KeyFingerprint: wire.Fingerprint(r.key), Repo: pin, Tag: r.tag}, nil
+	chip := w.chips[name]
+	if chip == "" {
+		chip = "machine-1"
+	}
+	return &attest.Peer{Key: r.key, KeyFingerprint: wire.Fingerprint(r.key), Repo: pin, Tag: r.tag, ChipID: chip}, nil
 }
 
 func (w *world) enroll(pin, name, tag string) *ecdh.PrivateKey {
@@ -378,6 +383,25 @@ func TestRestoreFromShares(t *testing.T) {
 	}
 	if got := fresh.status(t)["keyset_commitment"]; got != commitment {
 		t.Fatalf("restored %v, want %s", got, commitment)
+	}
+}
+
+func TestStatusReportsASharedMachine(t *testing.T) {
+	f := newFixture(t, 2, 1)
+	commitment, a := f.bootstrap()
+	f.w.chips = map[string]string{"vault-b-elsewhere": "machine-2"}
+	for name, want := range map[string]bool{"vault-b": true, "vault-b-elsewhere": false} {
+		b := f.vault(name, "v0.1.1", commitment)
+		if err := b.s.PullFrom(context.Background(), a.url); err != nil {
+			t.Fatal(err)
+		}
+		if err := b.s.SelfCheck(context.Background()); err != nil {
+			t.Fatal(err)
+		}
+		st := b.status(t)
+		if st["same_chip_as_last_peer"] != want {
+			t.Errorf("%s: same_chip_as_last_peer = %v, want %v (status %v)", name, st["same_chip_as_last_peer"], want, st)
+		}
 	}
 }
 

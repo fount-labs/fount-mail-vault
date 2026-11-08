@@ -281,6 +281,11 @@ func (s *Server) handleStatus(w http.ResponseWriter, _ *http.Request) {
 	if s.self != nil {
 		status["release_tag"] = s.self.Tag
 		status["freshness_expires_at"] = s.self.FreshnessExpiresAt
+		status["chip_id"] = s.self.ChipID
+		if s.lastPeer != nil && s.lastPeer.Peer != nil {
+			// Two vaults on one machine fail together, which leaves only the shares.
+			status["same_chip_as_last_peer"] = s.lastPeer.Peer.ChipID == s.self.ChipID
+		}
 	}
 	writeJSON(w, http.StatusOK, status)
 }
