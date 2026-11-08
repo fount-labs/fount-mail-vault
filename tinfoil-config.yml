@@ -35,7 +35,7 @@ containers:
       - VAULT_REPO: "fount-labs/fount-mail-vault"
       - EDGE_REPO: "fount-labs/fount-mail-edge"
       - EDGE_MIN_TAG: "v0.1.0" # raise to retire old edge releases
-      - KEYSET_COMMITMENT: "" # empty only in the release that generates; see README
+      - KEYSET_COMMITMENT: "db2d1d4e7a8e474c78d48b89e93ccac6d9810776cda72ca8955000f9987dcb95" # empty only in the release that generates; see README
       - VAULT_PEERS: "vault-a.fount.containers.tinfoil.dev,vault-b.fount.containers.tinfoil.dev"
       - RECOVERY_RECIPIENTS: "age1fuy00zm6yjuygfxxng6tsnugy2qkc0qdsfqcxer2p3um6u2a347slrf550,age1w8709c8vfnrevkmlz75n34n074elz4tgv220jx9vlf4qfsu3ruksaelxer" # comma-separated age1... keys, held offline
       - RECOVERY_THRESHOLD: "1"
