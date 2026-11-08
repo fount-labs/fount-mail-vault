@@ -34,6 +34,7 @@ const usage = `vaultctl <command> [flags]
   import-s3       -vault HOST -tag vX.Y.Z -operator-key FILE   (reads AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY)
   operator-keygen -out FILE
   recovery-keygen -out FILE   (an age identity for one shareholder; run it offline)
+  recovery-recipient -identity FILE   (prints its age1… recipient, to check a copy)
 `
 
 type multi []string
@@ -73,6 +74,11 @@ func main() {
 		err = operatorKeygen(*out)
 	case "recovery-keygen":
 		err = recoveryKeygen(*out)
+	case "recovery-recipient":
+		var r string
+		if r, err = recoveryRecipient(identities); err == nil {
+			fmt.Println("RECOVERY_RECIPIENT:", r)
+		}
 	default:
 		fmt.Fprint(os.Stderr, usage)
 		os.Exit(2)
@@ -289,6 +295,26 @@ func recoveryKeygen(out string) error {
 	}
 	fmt.Printf("wrote %s\nRECOVERY_RECIPIENT: %s\n", out, recipient)
 	return nil
+}
+
+// recoveryRecipient prints the recipient an identity file opens, so a copy typed back
+// in from paper can be checked against the one in the config.
+func recoveryRecipient(paths []string) (string, error) {
+	if len(paths) != 1 {
+		return "", errors.New("give exactly one -identity")
+	}
+	ids, err := readIdentities(paths)
+	if err != nil {
+		return "", err
+	}
+	if len(ids) != 1 {
+		return "", fmt.Errorf("%s holds %d identities, want 1", paths[0], len(ids))
+	}
+	x, ok := ids[0].(*age.X25519Identity)
+	if !ok {
+		return "", fmt.Errorf("%s isn't an X25519 identity", paths[0])
+	}
+	return x.Recipient().String(), nil
 }
 
 func fail(msg string) {

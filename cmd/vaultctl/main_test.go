@@ -25,6 +25,9 @@ func TestRecoveryKeygenOpensItsShare(t *testing.T) {
 		_, rest, _ := strings.Cut(string(raw), "# public key: ")
 		recipient, _, _ := strings.Cut(rest, "\n")
 		recipients = append(recipients, recipient)
+		if got, err := recoveryRecipient([]string{path}); err != nil || got != recipient {
+			t.Fatalf("recovery-recipient = %q, %v; want %q", got, err, recipient)
+		}
 		paths = append(paths, path)
 		if info, _ := os.Stat(path); info.Mode().Perm() != 0o600 {
 			t.Fatalf("%s mode = %v", name, info.Mode().Perm())

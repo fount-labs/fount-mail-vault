@@ -51,6 +51,22 @@ That's public, so write both down.
 Then eject both drives and store them in different places, such as home and a safe
 deposit box. Losing both identities, and then both vaults, loses every mailbox ID for good.
 
+### Where the copies go
+
+At a threshold of 1, either identity plus the bundle rebuilds every key, so treat each
+one as the whole keyset. The bundle is encrypted to the identities and is safe anywhere.
+That gives you three things to keep, each in a different place:
+
+| What | Where | Why there |
+|---|---|---|
+| `recovery-a.txt` | Drive A, plus a paper copy of its `AGE-SECRET-KEY-1…` line. To check the paper, type it into a file on the offline machine and run `vaultctl recovery-recipient -identity FILE`, which should print the same `age1…` | Paper survives a dead drive and never touches a network |
+| `recovery-b.txt` | Drive B, or a Bitwarden secure note behind a hardware security key, with no SMS or email recovery on the account | Off-site and always reachable, and a phished password alone doesn't open it |
+| The bundle (`vaultctl bundle`) | Anywhere except the Bitwarden vault that holds `recovery-b` | Keeping it with an identity would put a full recovery behind one login |
+
+Putting both identities in Bitwarden makes the vault's master password and second factor
+enough to recover the keyset, which is the single point of failure the two vaults were
+built to avoid. Keep at least one identity offline.
+
 ## 3. Make the operator key
 
 On the networked laptop:
