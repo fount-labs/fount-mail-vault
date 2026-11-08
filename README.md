@@ -1,8 +1,12 @@
 # Fount Mail vault
 
 Holds Fount Mail's keyset in enclave memory, on Tinfoil, and hands it only to verified vault and
-edge releases. No person, AWS account, or disk ever holds the keys in plaintext. The design is in
-`fount/docs/features/fount-fleet/fount-mail-vault.md`.
+edge releases. No person, AWS account, or disk holds the keys in plaintext. Recovery identities
+can rebuild them, and at launch one identity is enough, so `docs/KEYS.md` keeps them offline. The
+design is in
+Fount's internal design doc, and the edge's
+[`docs/DESIGN.md`](https://github.com/fount-labs/fount-mail-edge/blob/main/docs/DESIGN.md) has
+the public trust model.
 
 ```text
 vault-a <-> vault-b       restore each other; both verify
@@ -70,16 +74,20 @@ was the first generator, and never deployed: its egress allowlist named `vault-b
 
 ## Repos and releases
 
-This repo and `fount-labs/fount-mail-edge` are public, so anyone can rebuild a release and compare
-it with what runs. A ruleset on each makes `v*` tags creatable only by org admins, and permanent
-once pushed. Whoever can release can get the keys, so `docs/KEYS.md` lists the accounts that
+This repo and [`fount-labs/fount-mail-edge`](https://github.com/fount-labs/fount-mail-edge) are
+public, so anyone can rebuild a release and compare it with what runs:
+`scripts/verify-release.sh vX.Y.Z` rebuilds at the tag, compares with the pinned digest, and checks
+both live vaults' attestations against that tag. It fails if any check can't run. `v0.1.2` passed
+on 2026-11-08. No scheduled job runs it yet. A ruleset on each repo makes `v*` tags creatable only
+by org admins, who can also bypass it to move or delete one. Whoever can release can get the keys, so `docs/KEYS.md` lists the accounts that
 need hardware keys.
 
 To release: run *Build Image* from `main`, pin the digest it reports in `tinfoil-config.yml`,
 commit, then `git tag vX.Y.Z && git push origin vX.Y.Z`. The tag push runs *Tinfoil Release*,
 which checks the tag is on `main` and the config has no placeholders, then measures, publishes,
 and marks the release latest so its witness renews. The pushed image is the output of
-`scripts/build-image.sh`, which CI builds on two runners and requires to match.
+`scripts/build-image.sh`, which pins BuildKit by digest. CI builds it on an x86 and an Arm
+runner and requires the same digest.
 
 ## Routine work
 
@@ -88,8 +96,9 @@ and marks the release latest so its witness renews. The pushed image is the outp
 - **Rolling back.** Roll forward instead: release the old code under a new tag. A lower tag would
   be refused.
 - **Watching.** `/status` shows `freshness_expires_at`, from an hourly self-check, plus
-  `refusals`, `chip_id`, and `same_chip_as_last_peer`. `fount-infra`'s `MailWatchStack` reads it
-  every 15 minutes and emails on problems, and on every new release of either repo.
+  `refusals`, `chip_id`, and `same_chip_as_last_peer`. Fount's watcher will read it every 15
+  minutes and email on problems, and on every new release of either repo. It's built and not
+  deployed yet.
 
 ## Full recovery
 

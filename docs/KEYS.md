@@ -102,8 +102,9 @@ second factor:
 | Tinfoil | Can stop or delete the enclaves, which forces a recovery from shares. Can't read the keys |
 | Bitwarden, if it holds a recovery copy | Opens that identity |
 
-Releases are public, and `fount-infra`'s mail watcher emails on every one, so a release you
-didn't make shows up within 15 minutes. That's detection, not prevention. Preventing it takes
+Releases are public. Once Fount's mail watcher is deployed, it emails on every one, so a release
+you didn't make shows up within 15 minutes. It isn't deployed yet. Even then, that's detection,
+not prevention. Preventing it takes
 the outside custodian below.
 
 ## Later: an outside custodian
