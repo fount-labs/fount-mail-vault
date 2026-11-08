@@ -10,13 +10,12 @@ attested-keys:
     key: x25519
 
 networks:
-  # A vault only calls the other vault. Edges call in, and verification does no
-  # network I/O, so nothing else is reachable.
+  # A vault only calls the other vault, and verification does no network I/O. The
+  # egress is open because Tinfoil resolves every allowlisted name when it builds the
+  # firewall, and a vault has to boot while its peer doesn't exist: vault-a first, and
+  # either one after the other is gone. v0.1.0 failed to deploy on exactly that.
   peers:
-    egress: allowlist
-    allow:
-      - vault-a.fount.containers.tinfoil.dev
-      - vault-b.fount.containers.tinfoil.dev
+    egress: open
 
 containers:
   - name: vault

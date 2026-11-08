@@ -51,20 +51,22 @@ creates Tinfoil containers but leaves every GitHub push and release to you.
 1. Make the keys, following `docs/KEYS.md`: one recovery identity per shareholder, made
    offline with `vaultctl recovery-keygen`, and the operator key.
 2. Fill in `RECOVERY_RECIPIENTS` and `OPERATOR_KEY`. Run *Build Image* and pin the digest it
-   reports, then release `v0.1.0` with an empty commitment.
-3. Deploy `vault-a` from `v0.1.0`, and run `curl -X POST https://vault-a.../generate`. It answers
+   reports, then release `v0.1.1` with an empty commitment.
+3. Deploy `vault-a` from `v0.1.1`, and run `curl -X POST https://vault-a.../generate`. It answers
    with the commitment.
 4. Run `vaultctl bundle -vault vault-a... -out keyset.bundle.json`, then `vaultctl check-bundle`
    with enough identities to meet the threshold. Store copies of the bundle in several places.
-5. Set `KEYSET_COMMITMENT` and release `v0.1.1`. Upgrade `vault-a` with
-   `tinfoil container update vault-a --tag v0.1.1 --hold=true`. The candidate pulls from
+5. Set `KEYSET_COMMITMENT` and release `v0.1.2`. Upgrade `vault-a` with
+   `tinfoil container update vault-a --tag v0.1.2 --hold=true`. The candidate pulls from
    production by itself. Check its `/status` on port 4443, then promote.
-6. Deploy `vault-b` from `v0.1.1`, and import the S3 credentials with `vaultctl import-s3`.
+6. Deploy `vault-b` from `v0.1.2`, and import the S3 credentials with `vaultctl import-s3`.
 7. Release the edge with the same commitment and `OPERATOR_KEY`. Its first boot waits for
    `edgectl init`, then add `abuse@` and `postmaster@` with `edgectl provision`. The edge's
    `docs/BUILD.md` has the commands.
 
-`v0.1.0` can never get the keys back, because every later release is above it.
+`v0.1.1` can never get the keys back, because every later release is above it. `v0.1.0`
+was the first generator, and never deployed: its egress allowlist named `vault-b` before
+`vault-b` existed.
 
 ## Repos and releases
 

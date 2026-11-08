@@ -4,11 +4,11 @@
 #
 #   scripts/live.sh fill AGE1A,AGE1B HEX      put the public keys from docs/KEYS.md in both configs
 #   scripts/live.sh preflight                 configs filled, tools present, release exists
-#   scripts/live.sh generate                  deploy vault-a from v0.1.0 and generate
+#   scripts/live.sh generate                  deploy vault-a from v0.1.1 and generate
 #   scripts/live.sh bundle ID [ID ...]        fetch the bundle and rebuild the keyset offline
 #   scripts/live.sh commit                    write KEYSET_COMMITMENT into tinfoil-config.yml
-#   scripts/live.sh upgrade-a                 vault-a to v0.1.1 through a held candidate
-#   scripts/live.sh deploy-b                  vault-b from v0.1.1, pulling from vault-a
+#   scripts/live.sh upgrade-a                 vault-a to v0.1.2 through a held candidate
+#   scripts/live.sh deploy-b                  vault-b from v0.1.2, pulling from vault-a
 #   scripts/live.sh import-s3                 S3 credentials into both vaults
 #   scripts/live.sh edge ABUSE.json POSTMASTER.json
 #                                             deploy the edge, init routing, add role mailboxes
@@ -20,8 +20,8 @@ set -euo pipefail
 
 VAULT_REPO=${VAULT_REPO:-fount-labs/fount-mail-vault}
 EDGE_REPO=${EDGE_REPO:-fount-labs/fount-mail-edge}
-GEN_TAG=${GEN_TAG:-v0.1.0}
-TAG=${TAG:-v0.1.1}
+GEN_TAG=${GEN_TAG:-v0.1.1}
+TAG=${TAG:-v0.1.2}
 EDGE_TAG=${EDGE_TAG:-v0.1.0}
 OPERATOR_KEY_FILE=${OPERATOR_KEY_FILE:-$HOME/.fount/operator.key}
 EDGE_DIR=${EDGE_DIR:-$(cd "$(dirname "$0")/../../fount-mail-edge" 2>/dev/null && pwd || true)}
