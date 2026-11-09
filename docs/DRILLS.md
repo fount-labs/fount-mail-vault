@@ -11,7 +11,7 @@ Run them in this order. Each one leans on the one before it.
 |---|---|---|
 | 1. Bundle check | Every stored bundle copy, plus one drive, rebuilds the keyset | The drives, an offline laptop |
 | 2. Restart | A vault that loses its memory gets the same keyset back from its peer | Both vaults healthy, a fresh witness |
-| 3. Recovery | An empty vault rebuilds the keyset from shares, live | A drill repo and release, a spare container, a `vaultctl` change |
+| 3. Recovery | An empty vault rebuilds the keyset from shares, live | A drill repo and release, a spare container, `vaultctl submit-share -offline-first` |
 | 4. Routing restore | The edge's `routing/current` comes back from the backup bucket | A first routing backup. The edge's `docs/RESTORE.md` covers it |
 
 ## Before any drill
@@ -128,20 +128,28 @@ controls for as long as the drill vault lives.
 
 ### The identity is read offline
 
-`vaultctl submit-share` decrypts the share and sends it in one run, so the network has to be up
-while the drive is mounted. That breaks the rule in `docs/KEYS.md`. The fix is a small change to
-vaultctl, which this group doesn't own. It's under "Requests between groups" in
-`m2-m3-parallel-work.md`:
+Plain `vaultctl submit-share` decrypts the share and sends it in one run, so the network has to
+be up while the drive is mounted. That breaks the rule in `docs/KEYS.md`. `-offline-first`
+splits the run in two:
 
-> `submit-share -offline-first`: read the bundle and identity, decrypt, then print "Eject the
-> drive and turn the network on, then press Enter". Only after that does it run
-> `/operator/begin`, verify the attestation, seal, and send. The share stays in memory and never
-> touches a disk.
+1. With the network off, it reads the bundle and the identity and decrypts every share the
+   identity opens. A wrong identity or a bad bundle fails here, before any prompt.
+2. It prints `opened N share(s); nothing has been sent yet`, then
+   `Eject the drive and turn the network on, then press Enter: `, and waits for a line on
+   stdin. EOF or Ctrl-C ends it with nothing sent.
+3. Only after Enter does it run `/operator/begin`, verify the attestation against `-repo` and
+   `-tag`, seal, and send. Its three-minute timeout starts at Enter, not at launch.
 
-An offline seal doesn't fit instead, because the `/operator/begin` nonce lasts two minutes.
+The share stays in memory, is never written to disk, and its buffer is zeroed once it's sent
+or the run fails. An offline seal doesn't fit instead, because the `/operator/begin` nonce
+lasts two minutes.
+
+`-offline-first` doesn't check that the network is really off. Check that yourself before you
+mount the drive. The parsed identity is held by the age library, which gives no way to zero
+it, so it stays in memory until vaultctl exits, which it does as soon as the share is sent.
 
 At threshold 1 the share is the whole keyset, so it's still in memory while the laptop is
-online. What the change protects is the identity, which opens every future bundle made for
+online. What the flag protects is the identity, which opens every future bundle made for
 the same recipients.
 
 ### Steps
@@ -157,8 +165,11 @@ Owner actions, in order:
    an empty `self_check_error`.
 4. With Wi-Fi off and drive A mounted, run:
    `vaultctl submit-share -offline-first -vault vault-drill.fount.containers.tinfoil.dev -repo fount-labs/fount-mail-vault-drill -tag v0.0.1 -bundle keyset.bundle.json -identity /Volumes/A/recovery-a.txt`.
-   When it prompts, eject the drive, turn the network on, and press Enter. It should print
-   `verified fount-labs/fount-mail-vault-drill v0.0.1` and `the vault restored the keyset`.
+   It should print `opened 1 share(s); nothing has been sent yet` and the prompt. Eject the
+   drive, turn the network on, and press Enter. It should then print
+   `verified fount-labs/fount-mail-vault-drill v0.0.1, transfer key …` and
+   `the vault restored the keyset`. Nothing is timed until Enter, so take as long as you need
+   at the prompt.
 5. `scripts/drill.sh recovery-status vault-drill.fount.containers.tinfoil.dev`. Pass: the
    committed keyset, source `restored from recovery shares`, `has_s3` false, since S3 isn't in
    the bundle, and no refusals.
