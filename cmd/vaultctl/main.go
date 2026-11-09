@@ -4,6 +4,7 @@
 package main
 
 import (
+	"bufio"
 	"context"
 	"crypto/ecdh"
 	"crypto/ed25519"
@@ -13,6 +14,7 @@ import (
 	"errors"
 	"flag"
 	"fmt"
+	"io"
 	"net/http"
 	"os"
 	"strings"
@@ -30,7 +32,8 @@ const usage = `vaultctl <command> [flags]
 
   bundle          -vault HOST -out FILE
   check-bundle    -bundle FILE -identity FILE [-identity FILE ...]
-  submit-share    -vault HOST -tag vX.Y.Z -bundle FILE -identity FILE
+  submit-share    -vault HOST -tag vX.Y.Z -bundle FILE -identity FILE [-offline-first]
+                  (-offline-first decrypts with the network off, then waits for Enter before it connects)
   import-s3       -vault HOST -tag vX.Y.Z -operator-key FILE   (reads AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY)
   operator-keygen -out FILE
   recovery-keygen -out FILE   (an age identity for one shareholder; run it offline)
@@ -54,6 +57,7 @@ func main() {
 	out := fs.String("out", "", "output file")
 	bundlePath := fs.String("bundle", "", "recovery bundle")
 	operatorKey := fs.String("operator-key", "", "operator key file")
+	offlineFirst := fs.Bool("offline-first", false, "submit-share: decrypt first, then wait for Enter before any network call")
 	var identities multi
 	fs.Var(&identities, "identity", "age identity file")
 	fs.Parse(os.Args[2:])
@@ -67,7 +71,11 @@ func main() {
 	case "check-bundle":
 		err = checkBundle(*bundlePath, identities)
 	case "submit-share":
-		err = submitShare(ctx, client(*host, *repo, *tag), *bundlePath, identities)
+		var gate func(int) error
+		if *offlineFirst {
+			gate = func(opened int) error { return waitForEnter(os.Stdin, os.Stderr, opened) }
+		}
+		err = submitShare(context.Background(), client(*host, *repo, *tag), *bundlePath, identities, gate)
 	case "import-s3":
 		err = importS3(ctx, client(*host, *repo, *tag), *operatorKey)
 	case "operator-keygen":
@@ -193,7 +201,14 @@ func checkBundle(path string, identityPaths []string) error {
 	return nil
 }
 
-func submitShare(ctx context.Context, c *opclient.Client, path string, identityPaths []string) error {
+// offlinePrompt is what -offline-first prints once the shares are open.
+const offlinePrompt = "Eject the drive and turn the network on, then press Enter"
+
+// submitShare opens every share it can before it touches the network. With a gate
+// (-offline-first) it waits on it between the two, so the identity's drive is ejected
+// before the laptop goes online. The timeout starts after the gate, since the vault's
+// /operator/begin nonce lasts two minutes. Shares stay in memory and are zeroed.
+func submitShare(parent context.Context, c *opclient.Client, path string, identityPaths []string, gate func(opened int) error) error {
 	b, err := readBundle(path)
 	if err != nil {
 		return err
@@ -206,6 +221,18 @@ func submitShare(ctx context.Context, c *opclient.Client, path string, identityP
 	if err != nil {
 		return err
 	}
+	defer func() {
+		for _, share := range shares {
+			clear(share)
+		}
+	}()
+	if gate != nil {
+		if err := gate(len(shares)); err != nil {
+			return err
+		}
+	}
+	ctx, cancel := context.WithTimeout(parent, 3*time.Minute)
+	defer cancel()
 	for _, share := range shares {
 		restored, err := c.SubmitShare(ctx, share)
 		clear(share)
@@ -218,6 +245,16 @@ func submitShare(ctx context.Context, c *opclient.Client, path string, identityP
 		}
 	}
 	fmt.Println("share accepted; the vault needs more before it can restore")
+	return nil
+}
+
+// waitForEnter prints the prompt and blocks until a full line arrives on in. Anything
+// short of a newline, such as EOF, aborts before the network is touched.
+func waitForEnter(in io.Reader, out io.Writer, opened int) error {
+	fmt.Fprintf(out, "opened %d share(s); nothing has been sent yet\n%s: ", opened, offlinePrompt)
+	if _, err := bufio.NewReader(in).ReadString('\n'); err != nil {
+		return fmt.Errorf("no Enter on stdin (%v); nothing was sent", err)
+	}
 	return nil
 }
 
