@@ -63,13 +63,19 @@ func (s *Server) handleFinish(w http.ResponseWriter, r *http.Request) {
 	}
 
 	s.mu.Lock()
-	keyset, s3 := s.keyset, s.s3
+	keyset, s3, send := s.keyset, s.s3, s.sendKeyset
 	s.mu.Unlock()
 	if keyset == nil {
 		writeError(w, http.StatusConflict, errNoKeyset)
 		return
 	}
-	payload, err := json.Marshal(wire.Payload{Keyset: keyset.MarshalBinary(), S3: s3})
+	p := wire.Payload{Keyset: keyset.MarshalBinary(), S3: s3}
+	// An edge can't authenticate a send keyset its release doesn't commit to, so
+	// until this release has the send commitment, only vaults get it.
+	if send != nil && (kind == kindVault || s.cfg.SendCommitment != "") {
+		p.SendKeyset = send.MarshalBinary()
+	}
+	payload, err := json.Marshal(p)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, err)
 		return

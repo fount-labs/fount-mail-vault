@@ -211,7 +211,7 @@ case "${1:-}" in
     for v in vault-a vault-b; do
       h=$(domain "$v" 2>/dev/null) || { echo "$v: not deployed"; continue; }
       echo "$v ($h):"
-      status "$h" | jq '{release_tag, has_keyset, keyset_commitment, has_s3, freshness_expires_at,
+      status "$h" | jq '{release_tag, has_keyset, keyset_commitment, has_send_keyset, send_keyset_commitment, has_s3, freshness_expires_at,
         self_check_error, chip_id, same_chip_as_last_peer, pending: .recovery.pending_shares,
         refusals: (.refusals // [] | length)}'
     done
