@@ -18,7 +18,7 @@ vault-a <-> vault-b       restore each other; both verify
 
 | Path | What it is |
 |---|---|
-| `wire/` | A nested module, standard library only: the keyset, its commitment, the sealed box, and the pull protocol. The edge imports it |
+| `wire/` | A nested module, standard library only: the keyset and the send keyset, their commitments, the sealed box, and the pull protocol. The edge imports it |
 | `internal/vault` | The server: generate, transfer with pins and minimum tags, restore from peers, recovery, and S3 import |
 | `internal/shamir` | Shamir's scheme over GF(256), constant-time |
 | `internal/recovery` | The recovery bundle: one age-encrypted share per recipient |
@@ -32,7 +32,8 @@ vault-a <-> vault-b       restore each other; both verify
 | Edge | `EDGE_REPO` | `EDGE_MIN_TAG` |
 
 An edge also needs the release to have a commitment. A vault that can't read its own tag refuses
-every vault peer.
+every vault peer. The send keyset, DKIM and the relay client key, rides in the same sealed pull,
+and an edge gets it only from a release with a `SEND_KEYSET_COMMITMENT`: see `docs/SEND-KEYS.md`.
 
 ## Config
 
@@ -42,6 +43,7 @@ missing or malformed.
 | Variable | Meaning |
 |---|---|
 | `KEYSET_COMMITMENT` | Empty only in the release that generates. Every later release must set it |
+| `SEND_KEYSET_COMMITMENT` | Empty only in the release that generates the send keyset, which needs `KEYSET_COMMITMENT`. See `docs/SEND-KEYS.md` |
 | `EDGE_MIN_TAG` | Raise it to retire old edge releases |
 | `VAULT_PEERS` | Both vault hostnames. Pulling from itself just fails |
 | `RECOVERY_RECIPIENTS`, `RECOVERY_THRESHOLD` | age X25519 recipients, one share each, and how many shares restore |
@@ -96,7 +98,7 @@ runner and requires the same digest.
 - **Rolling back.** Roll forward instead: release the old code under a new tag. A lower tag would
   be refused.
 - **Watching.** `/status` shows `freshness_expires_at`, from an hourly self-check, plus
-  `refusals`, `chip_id`, and `same_chip_as_last_peer`. Fount's watcher will read it every 15
+  `refusals`, `chip_id`, `same_chip_as_last_peer`, and `has_send_keyset`. Fount's watcher will read it every 15
   minutes and email on problems, and on every new release of either repo. It's built and not
   deployed yet.
 

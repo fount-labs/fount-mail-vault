@@ -139,7 +139,7 @@ func (s *Server) handleShare(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusOK, map[string]any{"accepted": true, "restored": false, "pending_shares": len(pending)})
 		return
 	}
-	s.install(k, nil, "restored from recovery shares")
+	s.install(k, nil, nil, "restored from recovery shares")
 	s.mu.Lock()
 	for _, p := range s.pending {
 		clear(p)

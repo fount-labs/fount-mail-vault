@@ -99,19 +99,24 @@ func newFixture(t *testing.T, recipients, threshold int) *fixture {
 }
 
 func (f *fixture) config(commitment string) *vault.Config {
+	return f.configWith(commitment, "")
+}
+
+func (f *fixture) configWith(commitment, send string) *vault.Config {
 	var recipients []string
 	for _, id := range f.ids {
 		recipients = append(recipients, id.Recipient().String())
 	}
 	env := map[string]string{
-		"VAULT_REPO":          vaultRepo,
-		"EDGE_REPO":           edgeRepo,
-		"EDGE_MIN_TAG":        "v1.0.0",
-		"KEYSET_COMMITMENT":   commitment,
-		"VAULT_PEERS":         "vault-a.example,vault-b.example",
-		"RECOVERY_RECIPIENTS": strings.Join(recipients, ","),
-		"RECOVERY_THRESHOLD":  fmt.Sprint(f.threshold),
-		"OPERATOR_KEY":        hex.EncodeToString(f.operator.Public().(ed25519.PublicKey)),
+		"VAULT_REPO":             vaultRepo,
+		"EDGE_REPO":              edgeRepo,
+		"EDGE_MIN_TAG":           "v1.0.0",
+		"KEYSET_COMMITMENT":      commitment,
+		"SEND_KEYSET_COMMITMENT": send,
+		"VAULT_PEERS":            "vault-a.example,vault-b.example",
+		"RECOVERY_RECIPIENTS":    strings.Join(recipients, ","),
+		"RECOVERY_THRESHOLD":     fmt.Sprint(f.threshold),
+		"OPERATOR_KEY":           hex.EncodeToString(f.operator.Public().(ed25519.PublicKey)),
 	}
 	c, err := vault.LoadConfig(func(k string) string { return env[k] })
 	if err != nil {
@@ -127,8 +132,13 @@ type node struct {
 
 func (f *fixture) vault(name, tag, commitment string) *node {
 	f.t.Helper()
+	return f.vaultWith(name, tag, commitment, "", http.DefaultClient)
+}
+
+func (f *fixture) vaultWith(name, tag, commitment, send string, client *http.Client) *node {
+	f.t.Helper()
 	key := f.w.enroll(vaultRepo, name, tag)
-	s := vault.NewServer(f.config(commitment), key, fakeAttester{name}, f.w, http.DefaultClient)
+	s := vault.NewServer(f.configWith(commitment, send), key, fakeAttester{name}, f.w, client)
 	ts := httptest.NewServer(s.Routes())
 	f.t.Cleanup(ts.Close)
 	return &node{s: s, url: ts.URL}
@@ -469,14 +479,15 @@ func TestLoadConfigRejectsMistakes(t *testing.T) {
 		t.Fatal(err)
 	}
 	for key, bad := range map[string]string{
-		"VAULT_REPO":          vaultRepo + "@v1.0.0",
-		"EDGE_REPO":           vaultRepo,
-		"EDGE_MIN_TAG":        "1.0.0",
-		"KEYSET_COMMITMENT":   "ABC",
-		"VAULT_PEERS":         "https://vault-a.example",
-		"RECOVERY_RECIPIENTS": "age1nope",
-		"RECOVERY_THRESHOLD":  "2",
-		"OPERATOR_KEY":        "00",
+		"VAULT_REPO":             vaultRepo + "@v1.0.0",
+		"EDGE_REPO":              vaultRepo,
+		"EDGE_MIN_TAG":           "1.0.0",
+		"KEYSET_COMMITMENT":      "ABC",
+		"SEND_KEYSET_COMMITMENT": "ABC",
+		"VAULT_PEERS":            "https://vault-a.example",
+		"RECOVERY_RECIPIENTS":    "age1nope",
+		"RECOVERY_THRESHOLD":     "2",
+		"OPERATOR_KEY":           "00",
 	} {
 		env := map[string]string{}
 		for k, v := range base {
