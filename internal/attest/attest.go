@@ -22,9 +22,13 @@ const transferKeyID = "transfer"
 // Peer is what a document proved.
 type Peer struct {
 	Key            *ecdh.PublicKey `json:"-"`
+	SendKey        *ecdh.PublicKey `json:"-"` // the endorsed send-transfer key; nil if none
 	KeyFingerprint string          `json:"key_fingerprint"`
-	Repo           string          `json:"repo"`
-	Tag            string          `json:"tag"`
+	// SendKeyFingerprint is set when the document endorses a send-transfer key,
+	// so /status shows which pulls got the send keyset in its own box.
+	SendKeyFingerprint string `json:"send_key_fingerprint,omitempty"`
+	Repo               string `json:"repo"`
+	Tag                string `json:"tag"`
 	// ChipID is the AMD CHIP_ID from the report: two enclaves with the same one run
 	// on the same physical machine.
 	ChipID             string     `json:"chip_id"`
@@ -64,11 +68,23 @@ func (t *Verifier) Verify(doc, nonce []byte, pin string) (*Peer, error) {
 	if err != nil {
 		return nil, err
 	}
+	var sendKey *ecdh.PublicKey
+	if spki, ok := verified.CryptoMaterialData(wire.SendTransferKeyID, document.KeySPKIV1Format); ok {
+		if sendKey, err = wire.ParseEndorsedKey(spki); err != nil {
+			return nil, fmt.Errorf("%q key: %w", wire.SendTransferKeyID, err)
+		}
+		if sendKey.Equal(key) {
+			return nil, fmt.Errorf("the %q key is the %q key", wire.SendTransferKeyID, transferKeyID)
+		}
+	}
 	chip, err := ChipID(doc)
 	if err != nil {
 		return nil, err
 	}
-	p := &Peer{Key: key, KeyFingerprint: wire.Fingerprint(key), Repo: verified.ConfigRepo(), Tag: verified.CodeTag(), ChipID: chip}
+	p := &Peer{Key: key, SendKey: sendKey, KeyFingerprint: wire.Fingerprint(key), Repo: verified.ConfigRepo(), Tag: verified.CodeTag(), ChipID: chip}
+	if sendKey != nil {
+		p.SendKeyFingerprint = wire.Fingerprint(sendKey)
+	}
 	if exp := verified.FreshnessExpiresAt(); !exp.IsZero() {
 		p.FreshnessExpiresAt = &exp
 	}

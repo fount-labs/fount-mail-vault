@@ -69,18 +69,32 @@ func (s *Server) handleFinish(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusConflict, errNoKeyset)
 		return
 	}
+	nonces := wire.Nonces{Issued: issued, Answer: answer}
 	p := wire.Payload{Keyset: keyset.MarshalBinary(), S3: s3}
+	var sendSealed []byte
 	// An edge can't authenticate a send keyset its release doesn't commit to, so
-	// until this release has the send commitment, only vaults get it.
+	// until this release has the send commitment, only vaults get it. An edge
+	// whose document endorses a send-transfer key gets it in a box of its own,
+	// sealed to that key, so the container holding `transfer` never sees it.
 	if send != nil && (kind == kindVault || s.cfg.SendCommitment != "") {
-		p.SendKeyset = send.MarshalBinary()
+		raw := send.MarshalBinary()
+		if kind == kindEdge && peer.SendKey != nil {
+			sendSealed, err = wire.Seal(wire.PurposeSendKeyset, s.transfer, peer.SendKey, nonces, raw)
+			clear(raw)
+			if err != nil {
+				writeError(w, http.StatusInternalServerError, err)
+				return
+			}
+		} else {
+			p.SendKeyset = raw
+		}
 	}
 	payload, err := json.Marshal(p)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, err)
 		return
 	}
-	sealed, err := wire.Seal(wire.PurposeKeyset, s.transfer, peer.Key, wire.Nonces{Issued: issued, Answer: answer}, payload)
+	sealed, err := wire.Seal(wire.PurposeKeyset, s.transfer, peer.Key, nonces, payload)
 	clear(payload)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, err)
@@ -91,7 +105,7 @@ func (s *Server) handleFinish(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadGateway, err)
 		return
 	}
-	writeJSON(w, http.StatusOK, wire.FinishResponse{Document: doc, HolderKey: s.transfer.PublicKey().Bytes(), Sealed: sealed})
+	writeJSON(w, http.StatusOK, wire.FinishResponse{Document: doc, HolderKey: s.transfer.PublicKey().Bytes(), Sealed: sealed, SendSealed: sendSealed})
 }
 
 // identify accepts a vault release or an edge release, and nothing else.
