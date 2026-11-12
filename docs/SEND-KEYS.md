@@ -18,9 +18,19 @@ Both commitment vectors are in `wire`'s tests, each computed separately in Pytho
 
 ## How it moves
 
-It rides in the same sealed box as the keyset, as `send_keyset` in `wire.Payload`, on the same
-`/transfer/begin` and `/transfer/finish` pull, with the same pins and minimum tags. There's no
-new endpoint for it, no new key, and no new auth.
+It moves on the same `/transfer/begin` and `/transfer/finish` pull as the keyset, with the same
+pins and minimum tags. There's no new endpoint and no new auth. Which box it rides in depends on
+the requester's document:
+
+- **The document endorses only `transfer`** (every vault, and edges up to v0.3.0): it rides in
+  the keyset's box, as `send_keyset` in `wire.Payload`.
+- **The document also endorses `send-transfer`** (a split edge, `wire.SendTransferKeyID`): it
+  rides in a box of its own, `send_sealed` in `wire.FinishResponse`, sealed with
+  `wire.PurposeSendKeyset` to the `send-transfer` key, and the keyset's box leaves it out. Tinfoil
+  grants each attested key to exactly one container, so the edge container holding `transfer`
+  (the keyset, S3 credentials) can't open it, and the one holding `send-transfer` can't open the
+  keyset's box. Both containers attest with the enclave's one document. The vault's `/status`
+  shows `send_key_fingerprint` on the last peer when it saw a `send-transfer` key.
 
 - **To a vault**, whenever the holder has one. A vault with a `SEND_KEYSET_COMMITMENT` takes only
   the matching send keyset, and a wrong one fails the whole pull, as a wrong keyset does. A
@@ -30,7 +40,8 @@ new endpoint for it, no new key, and no new auth.
   doesn't verify the vault and has nothing else to check the keys against.
 - **An edge or vault that predates it** calls `wire.Pull`, which never reads `send_keyset`. The
   field is also inside JSON, so an older `Payload` drops it. Edge v0.2.1 and vault v0.1.2 run
-  unchanged against a vault that has one.
+  unchanged against a vault that has one. An older `FinishResponse` drops `send_sealed` the
+  same way, and an edge with no `send-transfer` key never gets one.
 
 ## Restarts
 
@@ -54,7 +65,8 @@ If neither vault has it, nothing can make it again in that release: see "Losing 
 This mirrors the keyset's bootstrap. Suggested tags: `v0.2.0` is release N and `v0.2.1` is
 release N+1. Both keep `KEYSET_COMMITMENT` as it is.
 
-1. **Release N.** Merge, run *Build Image*, pin the digest, and release `v0.2.0` with
+1. **Release N.** Merge the send keyset (vault PR #3) and the separate send box
+   (`mail/F-send-transfer`), run *Build Image*, pin the digest, and release `v0.2.0` with
    `SEND_KEYSET_COMMITMENT: ""` and `/generate-send` in the shim paths, which `main` already has.
 2. **Upgrade both vaults to N**, each with `--hold=true`. Each candidate pulls the keyset from
    production as usual. Wait for `has_keyset` on port 4443, then promote. Upgrading both keeps
@@ -77,6 +89,9 @@ release N+1. Both keep `KEYSET_COMMITMENT` as it is.
    `f1._domainkey.fountbox.com`, `dkim_ed25519_txt` at `f1e._domainkey.fountbox.com`, and
    `relay_client_pin` on the relay (fount-infra).
 8. **Release the edge** with the same `SEND_KEYSET_COMMITMENT`, only after both vaults run N+1.
+   A split edge's sending container declares `send-transfer` and pulls with
+   `wire.PullSendKeyset`; it gets the send keyset only from a vault that has the separate box,
+   so both vaults must run a release with it (N+1 here, because N serves edges no send keyset).
 
 Between steps 3 and 5, vault-a holds the only copy, so do them in one sitting. If vault-a
 restarts in between, it pulls the keyset from vault-b, which has no send keyset, and the send
@@ -110,6 +125,14 @@ got, err := wire.PullKeysets(ctx, client, "https://"+host, transfer, attester, n
 rsaKey, err := got.SendKeyset.DKIMRSA()      // *rsa.PrivateKey, RSA-2048
 edKey, err := got.SendKeyset.DKIMEd25519()   // ed25519.PrivateKey
 relayKey, err := got.SendKeyset.RelayClient() // ed25519.PrivateKey
+```
+
+A split edge's sending container, holding `send-transfer` and not `transfer`:
+
+```go
+got, err := wire.PullSendKeyset(ctx, client, "https://"+host, sendTransfer, attester, nil,
+	cfg.SendKeysetCommitment)
+// got.SendKeyset is nil when that vault has none, or predates the separate box.
 ```
 
 `wire.ValidateCommitment` checks `SEND_KEYSET_COMMITMENT` at boot. A send keyset that doesn't

@@ -2,7 +2,9 @@ package vault_test
 
 import (
 	"context"
+	"crypto/ecdh"
 	"crypto/ed25519"
+	"crypto/rand"
 	"crypto/sha256"
 	"crypto/tls"
 	"crypto/x509"
@@ -340,4 +342,121 @@ func checkSendPublic(t *testing.T, got any, k *wire.SendKeyset) {
 			t.Errorf("send_public.%s = %v, want %s", field, pub[field], w)
 		}
 	}
+}
+
+// splitEdge is a split edge's two containers: core holds `transfer`, send holds
+// `send-transfer`, and both attest with the enclave's one document.
+type splitEdge struct {
+	core     *edge
+	sendKey  *ecdh.PrivateKey
+	attester fakeAttester
+}
+
+func (f *fixture) splitEdge(name, tag string) *splitEdge {
+	core := f.edge(name, tag)
+	sendKey, err := ecdh.X25519().GenerateKey(rand.Reader)
+	if err != nil {
+		f.t.Fatal(err)
+	}
+	r := f.w.releases[edgeRepo][name]
+	r.sendKey = sendKey.PublicKey()
+	f.w.releases[edgeRepo][name] = r
+	return &splitEdge{core: core, sendKey: sendKey, attester: core.a}
+}
+
+func (e *splitEdge) pullSend(base, send string) (*wire.SendPullResult, error) {
+	return wire.PullSendKeyset(context.Background(), http.DefaultClient, base, e.sendKey, e.attester, nil, send)
+}
+
+func TestSplitEdgeGetsTheSendKeysetInItsOwnBox(t *testing.T) {
+	f := newFixture(t, 2, 1)
+	commitment, send, gen, pinned := f.sendBootstrap()
+	e := f.splitEdge("edge-split", "v1.0.0")
+	want := wire.Commitments{Keyset: commitment, Send: send}
+
+	// Core opens the keyset's box, which leaves the send keyset out.
+	core, err := e.core.pullBoth(pinned.url, want)
+	if err != nil || !core.Keyset.Matches(commitment) || core.SendKeyset != nil {
+		t.Fatalf("core: %+v, %v", core, err)
+	}
+	// The send container opens only the send keyset's box.
+	got, err := e.pullSend(pinned.url, send)
+	if err != nil || got.SendKeyset == nil || !got.SendKeyset.Matches(send) {
+		t.Fatalf("send container: %+v, %v", got, err)
+	}
+	checkSendPublic(t, pinned.status(t)["send_public"], got.SendKeyset)
+
+	// Neither key opens the other's box.
+	raw := finishFor(t, pinned.url, e.attester)
+	if len(raw.SendSealed) == 0 {
+		t.Fatal("no send box for a document that endorses send-transfer")
+	}
+	holder, _ := wire.ParseRawKey(raw.HolderKey)
+	if _, err := wire.Open(wire.PurposeSendKeyset, e.core.key, holder, raw.nonces, raw.SendSealed); err == nil {
+		t.Fatal("the transfer key opened the send keyset's box")
+	}
+	if _, err := wire.Open(wire.PurposeKeyset, e.sendKey, holder, raw.nonces, raw.Sealed); err == nil {
+		t.Fatal("the send-transfer key opened the keyset's box")
+	}
+	if _, err := wire.Open(wire.PurposeKeyset, e.sendKey, holder, raw.nonces, raw.SendSealed); err == nil {
+		t.Fatal("the send keyset's box opened under the keyset's purpose")
+	}
+
+	// A wrong send commitment fails the send container's pull.
+	if _, err := e.pullSend(pinned.url, strings.Repeat("c", 64)); err == nil || !strings.Contains(err.Error(), "doesn't match the send commitment") {
+		t.Fatalf("send container took another send keyset: %v", err)
+	}
+	// A release with no send commitment gives an edge no send box.
+	if got, err := e.pullSend(gen.url, send); err != nil || got.SendKeyset != nil {
+		t.Fatalf("release N gave a split edge the send keyset: %+v, %v", got, err)
+	}
+	// Edges without send-transfer keep the single box.
+	old, err := f.edge("edge-v0.3.0", "v1.0.0").pullBoth(pinned.url, want)
+	if err != nil || old.SendKeyset == nil || !old.SendKeyset.Matches(send) {
+		t.Fatalf("an edge with no send-transfer key: %+v, %v", old, err)
+	}
+	// And a vault restarting from its peer still gets everything in one box.
+	peer := f.vaultWith("vault-b-send", tagSend, commitment, send, http.DefaultClient)
+	if err := peer.s.PullFrom(context.Background(), pinned.url); err != nil || peer.status(t)["send_keyset_commitment"] != send {
+		t.Fatalf("vault peer: %v, %v", err, peer.status(t))
+	}
+}
+
+func TestSplitEdgeFromAVaultWithNoSendKeyset(t *testing.T) {
+	f := newFixture(t, 2, 1)
+	commitment, send, _, _ := f.sendBootstrap()
+	mailOnly := f.vaultWith("vault-a-shares", tagSend, commitment, send, http.DefaultClient)
+	mailOnly.s.ForceKeyset(keysetFor(t, f, commitment))
+	e := f.splitEdge("edge-split", "v1.0.0")
+	if got, err := e.pullSend(mailOnly.url, send); err != nil || got.SendKeyset != nil {
+		t.Fatalf("send container from a vault with no send keyset: %+v, %v", got, err)
+	}
+	if _, err := e.pullSend(mailOnly.url, ""); err == nil {
+		t.Fatal("a send pull with no commitment and no holder check ran")
+	}
+}
+
+type rawFinish struct {
+	wire.FinishResponse
+	nonces wire.Nonces
+}
+
+// finishFor runs begin and finish by hand, to look at both boxes.
+func finishFor(t *testing.T, base string, a fakeAttester) rawFinish {
+	t.Helper()
+	ctx := context.Background()
+	var begun wire.BeginResponse
+	if err := wire.PostJSON(ctx, http.DefaultClient, base+"/transfer/begin", nil, &begun); err != nil {
+		t.Fatal(err)
+	}
+	issued, _ := wire.DecodeNonce(begun.Nonce)
+	answer, _ := wire.RandomNonce()
+	doc, _ := a.Attest(ctx, issued)
+	var out rawFinish
+	req := wire.FinishRequest{Nonce: begun.Nonce, AnswerNonce: hex.EncodeToString(answer), Document: doc}
+	if err := wire.PostJSON(ctx, http.DefaultClient, base+"/transfer/finish", req, &out.FinishResponse); err != nil {
+		t.Fatal(err)
+	}
+	out.nonces = wire.Nonces{Issued: issued, Answer: answer}
+	return out
 }
