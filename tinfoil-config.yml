@@ -19,7 +19,7 @@ networks:
 
 containers:
   - name: vault
-    image: "ghcr.io/fount-labs/fount-mail-vault@sha256:2bac4acd7375148aca9e8f8a093f893a195b3c7f311f0cf173715e42bb75a391" # from Build Image
+    image: "ghcr.io/fount-labs/fount-mail-vault@sha256:3912264d5e9ef80fcb63ab9770d9f860d490ddcc84b9c22f3613dc9b9b4cff3b" # from Build Image
     networks: [peers]
     keys: [transfer]
     attestation: true
