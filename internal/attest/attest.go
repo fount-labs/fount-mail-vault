@@ -47,7 +47,7 @@ func NewVerifier() (*Verifier, error) {
 
 // CheckPin fails at boot on a pin tinfoil-go can't use.
 func (t *Verifier) CheckPin(pin string) error {
-	if err := t.v.CheckRepoVerifiability(pin); err != nil {
+	if err := t.v.CheckPinVerifiability(verify.Pin{Repo: pin}); err != nil {
 		return fmt.Errorf("pin %q: %w", pin, err)
 	}
 	return nil
@@ -56,7 +56,7 @@ func (t *Verifier) CheckPin(pin string) error {
 // Verify checks hardware, provenance against pin, freshness, and the nonce, then
 // returns the endorsed transfer key. It does no network I/O.
 func (t *Verifier) Verify(doc, nonce []byte, pin string) (*Peer, error) {
-	verified, err := t.v.VerifyV3(doc, nonce, pin)
+	verified, err := t.v.VerifyV3(doc, nonce, verify.Pin{Repo: pin})
 	if err != nil {
 		return nil, err
 	}

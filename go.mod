@@ -1,12 +1,12 @@
 module github.com/fount-labs/fount-mail-vault
 
-go 1.27.3
+go 1.27.4
 
 require (
 	filippo.io/age v1.3.2
 	github.com/fount-labs/fount-mail-vault/wire v0.0.0
-	github.com/tinfoilsh/tinfoil-go v0.17.0-rc.8
-	golang.org/x/mod v0.41.0
+	github.com/tinfoilsh/tinfoil-go v0.17.0-rc.10
+	golang.org/x/mod v0.42.0
 )
 
 require (
@@ -79,12 +79,12 @@ require (
 	go.opentelemetry.io/otel/trace v1.44.0 // indirect
 	go.uber.org/multierr v1.11.0 // indirect
 	go.yaml.in/yaml/v3 v3.0.5 // indirect
-	golang.org/x/crypto v0.57.0 // indirect
-	golang.org/x/net v0.60.0 // indirect
-	golang.org/x/sync v0.23.0 // indirect
-	golang.org/x/sys v0.48.0 // indirect
-	golang.org/x/term v0.46.0 // indirect
-	golang.org/x/text v0.42.0 // indirect
+	golang.org/x/crypto v0.59.0 // indirect
+	golang.org/x/net v0.62.0 // indirect
+	golang.org/x/sync v0.25.0 // indirect
+	golang.org/x/sys v0.50.0 // indirect
+	golang.org/x/term v0.48.0 // indirect
+	golang.org/x/text v0.44.0 // indirect
 	google.golang.org/genproto/googleapis/api v0.0.0-20260713224248-f5fc221cf8c4 // indirect
 	google.golang.org/genproto/googleapis/rpc v0.0.0-20260713224248-f5fc221cf8c4 // indirect
 	google.golang.org/grpc v1.83.2 // indirect
