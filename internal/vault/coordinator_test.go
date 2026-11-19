@@ -60,7 +60,7 @@ func (r *router) client() *http.Client {
 	return &http.Client{Timeout: 10 * time.Second, Transport: &http.Transport{
 		// A pooled connection would outlive a route taken down or moved.
 		DisableKeepAlives: true,
-		TLSClientConfig: &tls.Config{RootCAs: r.pool, ServerName: "example.com"},
+		TLSClientConfig:   &tls.Config{RootCAs: r.pool, ServerName: "example.com"},
 		DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
 			host, _, _ := strings.Cut(addr, ":")
 			r.mu.Lock()
