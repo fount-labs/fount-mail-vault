@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"crypto/ecdh"
+	"crypto/ed25519"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -27,10 +28,15 @@ type BeginResponse struct {
 
 // FinishRequest is the requester's document for the holder's nonce, plus a nonce
 // of its own for the holder's document.
+//
+// CoordinatorKey, from a Cloud coordinator only, asks the vault to boot a
+// generation for that per-boot Ed25519 key. The document is then for
+// BootNonce(nonce, key) rather than the nonce, so it vouches for the key.
 type FinishRequest struct {
-	Nonce       string `json:"nonce"`
-	AnswerNonce string `json:"answer_nonce"`
-	Document    []byte `json:"document"`
+	Nonce          string `json:"nonce"`
+	AnswerNonce    string `json:"answer_nonce"`
+	Document       []byte `json:"document"`
+	CoordinatorKey []byte `json:"coordinator_key,omitempty"`
 }
 
 // FinishResponse carries the sealed payload. HolderKey is unauthenticated on its
@@ -48,10 +54,17 @@ type FinishResponse struct {
 // has them; they rotate, so the commitment doesn't cover them. The send keyset
 // rides along when the vault has it and may serve it to this requester. A reader
 // that predates it ignores the field, as encoding/json does with unknown fields.
+//
+// GenerationKeyset and Register go only to vaults, never to a coordinator.
+// GenerationCertificate goes only to a coordinator whose pull booted a
+// generation.
 type Payload struct {
-	Keyset     []byte         `json:"keyset"`
-	S3         *S3Credentials `json:"s3,omitempty"`
-	SendKeyset []byte         `json:"send_keyset,omitempty"`
+	Keyset                []byte          `json:"keyset"`
+	S3                    *S3Credentials  `json:"s3,omitempty"`
+	SendKeyset            []byte          `json:"send_keyset,omitempty"`
+	GenerationKeyset      []byte          `json:"generation_keyset,omitempty"`
+	Register              json.RawMessage `json:"register,omitempty"`
+	GenerationCertificate string          `json:"generation_certificate,omitempty"`
 }
 
 type S3Credentials struct {
@@ -77,37 +90,71 @@ type PullResult struct {
 	// requester's document endorses a send-transfer key, which gets the send
 	// keyset in its own box instead (PullSendKeyset).
 	SendKeyset *SendKeyset
-	HolderKey  *ecdh.PublicKey
-	Elapsed    time.Duration
+	// GenerationKeyset and Register are a vault holder's, kept only by a
+	// requester with a HolderCheck or a Generation commitment.
+	GenerationKeyset *GenerationKeyset
+	Register         json.RawMessage
+	// GenerationCertificate is set by PullBoot.
+	GenerationCertificate string
+	HolderKey             *ecdh.PublicKey
+	Elapsed               time.Duration
 }
 
 // Commitments are what a requester accepts. Keyset is KEYSET_COMMITMENT. Send is
 // SEND_KEYSET_COMMITMENT: when it's set, a send keyset that doesn't match fails
 // the pull, and when it's empty, only a requester with a HolderCheck keeps one.
+// Generation is GENERATION_AUTHORITY_KEY: when it's set, a generation keyset
+// with another public key fails the pull.
 type Commitments struct {
-	Keyset string
-	Send   string
+	Keyset     string
+	Send       string
+	Generation string
 }
 
 // Pull fetches the keyset from a holder at base, such as https://vault-a.example.
 // With an empty commitment it needs a HolderCheck, because nothing else would
 // authenticate the keys. It never returns a send keyset; PullKeysets does.
 func Pull(ctx context.Context, client *http.Client, base string, me *ecdh.PrivateKey, a Attester, check HolderCheck, commitment string) (*PullResult, error) {
-	return pull(ctx, client, base, me, a, check, Commitments{Keyset: commitment}, false)
+	return pull(ctx, client, base, me, a, check, Commitments{Keyset: commitment}, false, nil)
+}
+
+// PullBoot is a Cloud coordinator's pull: Pull, plus a new generation for
+// coordinatorKey, its per-boot Ed25519 key, which the holder certifies with
+// the generation authority. The certificate must verify under authority and
+// name coordinatorKey.
+func PullBoot(ctx context.Context, client *http.Client, base string, me *ecdh.PrivateKey, a Attester, check HolderCheck, commitment string, coordinatorKey, authority ed25519.PublicKey) (*PullResult, error) {
+	if len(coordinatorKey) != ed25519.PublicKeySize {
+		return nil, errors.New("a boot needs the coordinator's Ed25519 key")
+	}
+	got, err := pull(ctx, client, base, me, a, check, Commitments{Keyset: commitment}, false, coordinatorKey)
+	if err != nil {
+		return nil, err
+	}
+	if got.GenerationCertificate == "" {
+		return nil, errors.New("the holder booted no generation")
+	}
+	c, err := VerifyGenerationCertificate(got.GenerationCertificate, authority)
+	if err != nil {
+		return nil, err
+	}
+	if !ed25519.PublicKey(c.CoordinatorKey).Equal(coordinatorKey) {
+		return nil, errors.New("the generation certificate names another coordinator key")
+	}
+	return got, nil
 }
 
 // PullKeysets is Pull, plus the send keyset. A holder with no send keyset isn't an
 // error: SendKeyset is nil, and the caller decides whether to try another holder.
 func PullKeysets(ctx context.Context, client *http.Client, base string, me *ecdh.PrivateKey, a Attester, check HolderCheck, want Commitments) (*PullResult, error) {
-	return pull(ctx, client, base, me, a, check, want, true)
+	return pull(ctx, client, base, me, a, check, want, true, nil)
 }
 
-func pull(ctx context.Context, client *http.Client, base string, me *ecdh.PrivateKey, a Attester, check HolderCheck, want Commitments, takeSend bool) (*PullResult, error) {
+func pull(ctx context.Context, client *http.Client, base string, me *ecdh.PrivateKey, a Attester, check HolderCheck, want Commitments, takeSend bool, coordinatorKey ed25519.PublicKey) (*PullResult, error) {
 	commitment := want.Keyset
 	if commitment == "" && check == nil {
 		return nil, errors.New("pulling with no commitment needs a holder check")
 	}
-	ex, err := exchange(ctx, client, base, a, check)
+	ex, err := exchange(ctx, client, base, a, check, coordinatorKey)
 	if err != nil {
 		return nil, err
 	}
@@ -135,7 +182,22 @@ func pull(ctx context.Context, client *http.Client, base string, me *ecdh.Privat
 			return nil, fmt.Errorf("send keyset %s doesn't match the send commitment %s", send.Commitment(), want.Send)
 		}
 	}
-	return &PullResult{Keyset: keyset, S3: payload.S3, SendKeyset: send, HolderKey: ex.holder, Elapsed: time.Since(ex.start)}, nil
+	res := &PullResult{Keyset: keyset, S3: payload.S3, SendKeyset: send, HolderKey: ex.holder, Elapsed: time.Since(ex.start),
+		GenerationCertificate: payload.GenerationCertificate}
+	if takeSend && len(payload.GenerationKeyset) > 0 && (want.Generation != "" || check != nil) {
+		gen, err := ParseGenerationKeyset(payload.GenerationKeyset)
+		if err != nil {
+			return nil, err
+		}
+		if want.Generation != "" && !gen.Matches(want.Generation) {
+			return nil, fmt.Errorf("generation keyset %s doesn't match the generation authority key %s", gen.AuthorityKey(), want.Generation)
+		}
+		res.GenerationKeyset = gen
+		if check != nil {
+			res.Register = payload.Register
+		}
+	}
+	return res, nil
 }
 
 // SendPullResult is what a send-transfer requester gets: the send keyset only.
@@ -155,7 +217,7 @@ func PullSendKeyset(ctx context.Context, client *http.Client, base string, me *e
 	if sendCommitment == "" && check == nil {
 		return nil, errors.New("pulling the send keyset with no send commitment needs a holder check")
 	}
-	ex, err := exchange(ctx, client, base, a, check)
+	ex, err := exchange(ctx, client, base, a, check, nil)
 	if err != nil {
 		return nil, err
 	}
@@ -187,8 +249,9 @@ type exchanged struct {
 }
 
 // exchange runs begin and finish: the requester attests to the holder's nonce,
-// and, with a HolderCheck, checks the holder's document for its own.
-func exchange(ctx context.Context, client *http.Client, base string, a Attester, check HolderCheck) (*exchanged, error) {
+// and, with a HolderCheck, checks the holder's document for its own. With a
+// coordinator key it attests to BootNonce instead, and sends the key.
+func exchange(ctx context.Context, client *http.Client, base string, a Attester, check HolderCheck, coordinatorKey ed25519.PublicKey) (*exchanged, error) {
 	start := time.Now()
 	var begun BeginResponse
 	if err := PostJSON(ctx, client, base+"/transfer/begin", nil, &begun); err != nil {
@@ -202,12 +265,16 @@ func exchange(ctx context.Context, client *http.Client, base string, a Attester,
 	if err != nil {
 		return nil, err
 	}
-	doc, err := a.Attest(ctx, issued)
+	attested := issued
+	if coordinatorKey != nil {
+		attested = BootNonce(issued, coordinatorKey)
+	}
+	doc, err := a.Attest(ctx, attested)
 	if err != nil {
 		return nil, fmt.Errorf("attesting to holder: %w", err)
 	}
 	var finished FinishResponse
-	req := FinishRequest{Nonce: begun.Nonce, AnswerNonce: hex.EncodeToString(answer), Document: doc}
+	req := FinishRequest{Nonce: begun.Nonce, AnswerNonce: hex.EncodeToString(answer), Document: doc, CoordinatorKey: coordinatorKey}
 	if err := PostJSON(ctx, client, base+"/transfer/finish", req, &finished); err != nil {
 		return nil, fmt.Errorf("finish: %w", err)
 	}

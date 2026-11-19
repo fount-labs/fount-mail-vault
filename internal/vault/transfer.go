@@ -2,9 +2,11 @@ package vault
 
 import (
 	"context"
+	"crypto/ed25519"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log"
 	"net/http"
 
 	"golang.org/x/mod/semver"
@@ -43,11 +45,23 @@ func (s *Server) handleFinish(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, err)
 		return
 	}
+	// A Cloud coordinator booting a generation attests to its per-boot key
+	// along with the nonce, so the document vouches for the key.
+	attested := issued
+	var coordinatorKey ed25519.PublicKey
+	if len(req.CoordinatorKey) > 0 {
+		if len(req.CoordinatorKey) != ed25519.PublicKeySize {
+			writeError(w, http.StatusBadRequest, errors.New("coordinator_key is a 32-byte Ed25519 key"))
+			return
+		}
+		coordinatorKey = req.CoordinatorKey
+		attested = wire.BootNonce(issued, coordinatorKey)
+	}
 	if err := s.consumeNonce(req.Nonce, useTransfer); err != nil {
 		s.refuse(w, "nonce", err)
 		return
 	}
-	kind, peer, err := s.identify(req.Document, issued)
+	kind, peer, err := s.identify(req.Document, attested)
 	if err != nil {
 		s.refuse(w, "verify", err)
 		return
@@ -61,9 +75,14 @@ func (s *Server) handleFinish(w http.ResponseWriter, r *http.Request) {
 		s.refuse(w, "commitment", errors.New("this release has no commitment, so it serves only vaults"))
 		return
 	}
+	if coordinatorKey != nil && (kind != kindEdge || !s.cfg.CoordinatorMode) {
+		s.refuse(w, "boot", errors.New("only a Cloud vault boots a generation, and only for a coordinator"))
+		return
+	}
 
 	s.mu.Lock()
 	keyset, s3, send := s.keyset, s.s3, s.sendKeyset
+	gen := s.genKeyset
 	s.mu.Unlock()
 	if keyset == nil {
 		writeError(w, http.StatusConflict, errNoKeyset)
@@ -71,6 +90,26 @@ func (s *Server) handleFinish(w http.ResponseWriter, r *http.Request) {
 	}
 	nonces := wire.Nonces{Issued: issued, Answer: answer}
 	p := wire.Payload{Keyset: keyset.MarshalBinary(), S3: s3}
+	// The generation keyset and the register go to vaults only: a
+	// coordinator that held the authority could certify itself.
+	if kind == kindVault && gen != nil {
+		history, err := json.Marshal(s.reg.snapshot())
+		if err != nil {
+			writeError(w, http.StatusInternalServerError, err)
+			return
+		}
+		p.GenerationKeyset, p.Register = gen.MarshalBinary(), history
+	}
+	if coordinatorKey != nil {
+		cert, n, err := s.boot(r.Context(), coordinatorKey)
+		if err != nil {
+			log.Printf("boot for %s %s: %v", peer.Repo, peer.Tag, err)
+			writeError(w, http.StatusServiceUnavailable, fmt.Errorf("booting a generation: %w", err))
+			return
+		}
+		p.GenerationCertificate = cert
+		log.Printf("coordinator %s %s (%s) booted generation %d", peer.Repo, peer.Tag, peer.KeyFingerprint, n)
+	}
 	var sendSealed []byte
 	// An edge can't authenticate a send keyset its release doesn't commit to, so
 	// until this release has the send commitment, only vaults get it. An edge
