@@ -3,6 +3,7 @@ package vault
 import (
 	"context"
 	"crypto/ecdh"
+	"crypto/rand"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -91,17 +92,36 @@ type Server struct {
 	selfChecked time.Time
 	bundle      *recovery.Bundle
 	pending     [][]byte
+
+	// The Cloud vault's generation keyset and register (counter.go,
+	// register.go). instance is drawn per process.
+	genKeyset    *wire.GenerationKeyset
+	genSource    string
+	peerMAC      []byte
+	lastSync     *syncRecord
+	reg          register
+	instance     string
+	proposeMu    sync.Mutex
+	counterCalls chan struct{}
+	peerBase     func(host string) string
 }
 
 func NewServer(cfg *Config, transfer *ecdh.PrivateKey, a wire.Attester, v Verifier, client *http.Client) *Server {
+	instance := make([]byte, 16)
+	if _, err := rand.Read(instance); err != nil {
+		panic(err)
+	}
 	return &Server{
-		cfg:      cfg,
-		transfer: transfer,
-		attester: a,
-		verifier: v,
-		client:   client,
-		booted:   time.Now(),
-		nonces:   make(map[string]issuedNonce),
+		cfg:          cfg,
+		transfer:     transfer,
+		attester:     a,
+		verifier:     v,
+		client:       client,
+		booted:       time.Now(),
+		nonces:       make(map[string]issuedNonce),
+		instance:     hex.EncodeToString(instance),
+		counterCalls: make(chan struct{}, maxCounterCalls),
+		peerBase:     func(host string) string { return "https://" + host },
 	}
 }
 
@@ -117,6 +137,10 @@ func (s *Server) Routes() http.Handler {
 	mux.HandleFunc("POST /operator/begin", s.handleOperatorBegin)
 	mux.HandleFunc("POST /recovery/share", s.handleShare)
 	mux.HandleFunc("POST /operator/import", s.handleImport)
+	mux.HandleFunc("POST /generate-generation", s.handleGenerateGeneration)
+	mux.HandleFunc("POST "+wire.CounterPath, s.handleCounter)
+	mux.HandleFunc("POST "+pathHead, s.handlePeer)
+	mux.HandleFunc("POST "+pathApply, s.handlePeer)
 	return mux
 }
 
@@ -124,6 +148,9 @@ func (s *Server) Routes() http.Handler {
 // to restore from its peers. It returns when ctx ends.
 func (s *Server) Run(ctx context.Context) {
 	go s.restoreLoop(ctx)
+	if s.cfg.CoordinatorMode {
+		go s.syncLoop(ctx)
+	}
 	for {
 		if err := s.selfCheck(ctx); err != nil {
 			log.Printf("self check: %v", err)
@@ -143,7 +170,7 @@ func (s *Server) restoreLoop(ctx context.Context) {
 			if s.complete() {
 				return
 			}
-			if err := s.PullFrom(ctx, "https://"+peer); err != nil {
+			if err := s.PullFrom(ctx, s.peerBase(peer)); err != nil {
 				log.Printf("restore from %s: %v", peer, err)
 			}
 		}
@@ -151,7 +178,7 @@ func (s *Server) restoreLoop(ctx context.Context) {
 			return
 		}
 		if s.holds() {
-			log.Printf("holding the keyset, but no peer has the committed send keyset; asking again in %s", wait)
+			log.Printf("holding the keyset, but no peer has the committed send keyset or generation keyset; asking again in %s", wait)
 		}
 		select {
 		case <-ctx.Done():
@@ -178,12 +205,13 @@ func (s *Server) PullFrom(ctx context.Context, base string) error {
 		s.recordPeer(kindVault, peer)
 		return peer.Key, nil
 	}
-	want := wire.Commitments{Keyset: s.cfg.Commitment, Send: s.cfg.SendCommitment}
+	want := wire.Commitments{Keyset: s.cfg.Commitment, Send: s.cfg.SendCommitment, Generation: s.cfg.GenerationKey}
 	got, err := wire.PullKeysets(ctx, s.client, base, s.transfer, s.attester, check, want)
 	if err != nil {
 		return err
 	}
 	keyset, send := s.install(got.Keyset, got.SendKeyset, got.S3, "pulled from "+base)
+	gen, genErr := s.installPulledGeneration(got)
 	elapsed := got.Elapsed.Round(time.Millisecond)
 	if keyset {
 		log.Printf("restored keyset %s from %s in %s", got.Keyset.Commitment(), base, elapsed)
@@ -191,10 +219,28 @@ func (s *Server) PullFrom(ctx context.Context, base string) error {
 	if send {
 		log.Printf("restored send keyset %s from %s in %s", got.SendKeyset.Commitment(), base, elapsed)
 	}
-	if !keyset && !send {
-		return errors.New("the holder has no send keyset")
+	if gen {
+		log.Printf("restored generation keyset %s and the register from %s in %s", got.GenerationKeyset.AuthorityKey(), base, elapsed)
+	}
+	if genErr != nil {
+		return genErr
+	}
+	if !keyset && !send && !gen {
+		return errors.New("the holder has nothing this vault is missing")
 	}
 	return nil
+}
+
+// installPulledGeneration keeps a pulled generation keyset and its register.
+func (s *Server) installPulledGeneration(got *wire.PullResult) (bool, error) {
+	if got.GenerationKeyset == nil || !s.cfg.CoordinatorMode {
+		return false, nil
+	}
+	var history []regState
+	if err := json.Unmarshal(got.Register, &history); err != nil {
+		return false, fmt.Errorf("the holder's register: %w", err)
+	}
+	return s.installGeneration(got.GenerationKeyset, history, "pulled from a vault")
 }
 
 func (s *Server) holds() bool {
@@ -208,7 +254,7 @@ func (s *Server) holds() bool {
 func (s *Server) complete() bool {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	return s.keyset != nil && (s.cfg.SendCommitment == "" || s.sendKeyset != nil)
+	return s.keyset != nil && (s.cfg.SendCommitment == "" || s.sendKeyset != nil) && (s.cfg.GenerationKey == "" || s.genKeyset != nil)
 }
 
 // install keeps the first keyset and the first send keyset. With a commitment
@@ -314,6 +360,24 @@ func (s *Server) handleStatus(w http.ResponseWriter, _ *http.Request) {
 	}
 	if s.keyset != nil {
 		status["keyset_commitment"] = s.keyset.Commitment()
+	}
+	if s.cfg.CoordinatorMode {
+		cloud := map[string]any{
+			"config_authority_key": s.cfg.GenerationKey,
+			"generation_floor":     s.cfg.GenerationFloor,
+			"count_floor":          s.cfg.CountFloor,
+			"has_generation":       s.genKeyset != nil,
+			"generation_source":    s.genSource,
+			"instance":             s.instance,
+			"last_sync":            s.lastSync,
+		}
+		if s.genKeyset != nil {
+			cloud["authority_key"] = s.genKeyset.AuthorityKey()
+		}
+		if reg := s.registerStatus(); reg != nil {
+			cloud["register"] = reg
+		}
+		status["coordinator"] = cloud
 	}
 	if s.sendKeyset != nil {
 		status["send_keyset_commitment"] = s.sendKeyset.Commitment()

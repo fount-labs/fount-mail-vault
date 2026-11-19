@@ -1,4 +1,4 @@
-# Coordinator generations and the rollback counter (design, not built)
+# Coordinator generations and the rollback counter
 
 Fount Cloud's coordinator needs two things from its vault pair beyond the
 wrapping key (fount `launch-plan.md` decisions 17 and 18; broker
@@ -14,146 +14,283 @@ wrapping key (fount `launch-plan.md` decisions 17 and 18; broker
   `CompareAndSwap(generation, prev, next)` succeeds only when the generation
   is current, the count is `prev`, and `next > prev`. Moving the generation
   keeps the count. Only the current generation's coordinator may swap,
-  authenticated by the key its certificate names. A swap must be durable and
-  on both vaults before it returns.
+  authenticated by the key its certificate names. A swap is on both vaults
+  before it's answered.
 
-This note records why that isn't a small addition to this repo, and the shape
-proposed for it. Until it's built, the broker refuses backups under the
-vault's key. Dev and test coordinators use `--dev-vault`, a file
-(`coordinator.FileVault`) that behaves like the design below on one machine.
+Both are built: `wire/generation.go`, `wire/counter.go`, the boot in
+`wire/protocol.go` (`PullBoot`), and in the vault `internal/vault/register.go`
+and `counter.go`. The tests are `internal/vault/coordinator_test.go`, two
+vaults with a router that takes either down, restarts it or promotes a
+candidate.
 
-## Why it's more than an endpoint
+## Why it isn't a small addition
 
-1. **The Cloud vault is this code, unchanged.** To it, the coordinator is an
-   edge: `EDGE_REPO` is the coordinator's config repo. A coordinator release
-   at or above `EDGE_MIN_TAG` gets the keyset and the S3 credentials in one
-   sealed pull, and nothing else.
+1. **The Cloud vault is this code.** To it, the coordinator is an edge:
+   `EDGE_REPO` is the coordinator's config repo. A coordinator release at or
+   above `EDGE_MIN_TAG` gets the keyset and the S3 credentials in one sealed
+   pull.
 2. **The authority key can't come from the keyset.** The coordinator receives
-   the whole keyset and derives its wrapping key from it (broker
-   `internal/vaultkey`). If the authority key were derived from the keyset
-   too, any coordinator could certify its own next generation, and the fence
-   would mean nothing. The authority key must be held by the vaults alone.
-3. **The vault has no mutable state.** It holds immutable secrets in memory,
-   and a peer gets them in one pull. There's no disk, no write replication, no
-   version, and nothing for the upgrade candidate (`--hold=true`, then promote)
-   to catch up on after its pull. A counter that is durable and on both vaults
-   before a swap returns is a replicated register with compare-and-swap,
-   across two in-memory nodes.
+   the whole keyset and derives its wrapping key from it. If the authority
+   were derived from the keyset too, any coordinator could certify its own
+   next generation. So it's a third secret, held by the vaults alone.
+3. **The vault had no mutable state.** It held immutable secrets in memory.
+   A counter that is on both vaults before a swap returns is a replicated
+   register with compare-and-swap across two in-memory nodes.
 4. **A generation needs the coordinator's key bound to its attestation.**
-   Otherwise a party in the middle can swap the key in a boot request.
+   Otherwise a party in the middle could swap the key in a boot request.
 
-## Proposed design
+## Cloud mode
 
-### The generation keyset (vault-only)
+`COORDINATOR_MODE=1` turns it on. Without it, a vault refuses every call
+below (409) and a boot (403), and a mail vault behaves exactly as before.
+Cloud mode needs exactly two `VAULT_PEERS`, and `GENERATION_FLOOR` and
+`COUNT_FLOOR` (decimal, below 2^63).
 
-A third secret, built like the send keyset (`docs/SEND-KEYS.md`):
+The Cloud pair's own `tinfoil-config.yml` (not this repo's, which is the
+mail pair's) sets, beyond the mail vault's values:
 
-- **What it holds:** an Ed25519 authority seed.
-- **Commitment:** `sha256("fount-coordinator-generation-keyset/v1" ‖ bytes)`
-  as `GENERATION_KEYSET_COMMITMENT`.
-- **How it's made:** `POST /generate-generation`, in a release with a
-  `KEYSET_COMMITMENT` and no `GENERATION_KEYSET_COMMITMENT`. It answers the
-  commitment and the public key. That key becomes the edge's and the
-  coordinator's `COORDINATOR_AUTHORITY_KEY`.
-- **Who gets it:** it moves only vault to vault, in the keyset's pull. It's
-  never sent to an `EDGE_REPO` requester, which here is the coordinator.
-- **No recovery shares.** If both vaults die, generate a new one and release
-  the edge with the new public key. A new config value,
-  `GENERATION_FLOOR`, starts the numbering above the last generation the edge
-  saw, because the edge refuses a lower one.
+```yaml
+- EDGE_REPO: "<the coordinator's config repo>"
+- EDGE_MIN_TAG: "<the oldest coordinator release allowed>"
+- COORDINATOR_MODE: "1"
+- GENERATION_AUTHORITY_KEY: "<base64 public key>" # empty only in the generating release
+- GENERATION_FLOOR: "0"
+- COUNT_FLOOR: "0"
+```
 
-### Booting a generation
+and adds to the shim's paths `/generate-generation`, `/coordinator/counter`,
+`/register/head` and `/register/apply`. A vault calls both `VAULT_PEERS`
+hostnames, its own included, through the shim.
 
-The boot rides the existing pull, so there is no new authentication:
+## The generation keyset (vault-only)
 
-- **The request.** A Cloud-mode vault (a new `COORDINATOR_MODE=1`) reads
-  `coordinator_key` on `/transfer/finish` from an `EDGE_REPO` requester. The
-  requester's attestation nonce becomes
-  `sha256("fount-coordinator-boot/v1" ‖ issued nonce ‖ coordinator_key)`,
-  so the document vouches for the key.
-- **What the vault does.** It moves the register's generation on, keeps the
-  count, records the key as the current one, and puts
-  `generation_certificate` in the sealed payload, next to the keyset and the
-  S3 credentials.
-- **A retry after a lost answer** moves the generation again. That's harmless,
-  because the first one was never used.
+- **What it holds:** one Ed25519 seed, the authority. Serialized as version
+  byte `1` then the 32-byte seed.
+- **Commitment:** the authority's public key, standard base64 with padding,
+  as `GENERATION_AUTHORITY_KEY`. *This differs from the first draft, which
+  used a hash.* A public key commits to its seed just as well, and this way
+  the vault's `GENERATION_AUTHORITY_KEY`, the edge's
+  `COORDINATOR_AUTHORITY_KEY` and the coordinator's
+  `--coordinator-authority-key` are one string, which a reviewer compares by
+  eye.
+- **How it's made:** `POST /generate-generation`, once, in a Cloud release
+  with a `KEYSET_COMMITMENT`, no `GENERATION_AUTHORITY_KEY`, holding the
+  keyset. It answers the public key. The register starts there, at
+  `(GENERATION_FLOOR, COUNT_FLOOR)` and no key.
+- **Who gets it:** vaults only, in the keyset's sealed pull
+  (`Payload.GenerationKeyset`, with the register in `Payload.Register`).
+  An `EDGE_REPO` requester (the coordinator) never gets it or the register.
+  A release with `GENERATION_AUTHORITY_KEY` isn't "holding" until it has the
+  matching generation keyset, so it keeps pulling.
+- **No recovery shares.** If both vaults die, both the generation keyset and
+  the register are gone. See "Both vaults lost".
 
-### The counter calls
+## Booting a generation
 
-`POST /coordinator/counter`, plain HTTPS through the shim:
+The boot rides the existing pull (`wire.PullBoot`), so it has no new
+authentication:
 
-| Call | Request | Vault answer |
+1. The coordinator draws a per-boot Ed25519 key, gets the holder's one-use
+   nonce from `/transfer/begin`, and attests to
+   `sha256("fount-coordinator-boot/v1\x00" ‖ issued nonce ‖ coordinator_key)`
+   instead of the nonce.
+2. It sends `coordinator_key` on `/transfer/finish`.
+3. The vault verifies the document against that derived nonce, so the
+   document vouches for the key. It refuses a `coordinator_key` from a vault,
+   or in a vault without Cloud mode.
+4. The vault proposes the next register state: generation + 1, this key, the
+   count kept (see "Replication"). Only once both vaults hold it does the
+   vault sign the certificate and put it in the sealed payload as
+   `generation_certificate`, next to the keyset and the S3 credentials.
+5. The coordinator checks the certificate against its own measured authority
+   key, and that it names its key.
+
+A pull without `coordinator_key` is the plain keyset pull and moves nothing.
+The broker's restore dry run uses it. A retry after a lost answer moves the
+generation again. That's harmless: the first one was never used.
+
+The certificate is the edge's format exactly (`wire_test` pins a vector
+produced by the edge's own `generation.Sign`):
+`b64url(json{"generation","coordinator_key","issued_at"}) "." b64url(sig)`,
+with the signature over `"fount-coordinator-generation/v1\n" ‖ json`.
+
+## The counter
+
+`POST /coordinator/counter`, through the shim. Bodies are JSON, at most 4 KiB,
+and at most 16 calls run at once (more get 429).
+
+| Op | Request | Notes |
 |---|---|---|
-| `load` | `{op, nonce}`, unauthenticated: a dry run with no generation must be able to read it | `{generation, count, nonce}` |
-| `cas` | `{op, generation, prev, next, nonce}`, Ed25519-signed by the key the current certificate names (`Fount-Key-Id` and the label `fount-coordinator-counter/v1`, as on the edge's coordinator routes) | Success. Or 409 `stale_generation` (`ErrVaultGeneration`), or 409 `count_mismatch` with the count (`ErrVaultCount`) |
+| `load` | `{op, nonce}` | Unauthenticated: a dry run has no generation |
+| `cas` | `{op, nonce, generation, prev, next, signature}` | `signature` is Ed25519 by the current generation's key over `"fount-coordinator-counter/v1/cas\x00" ‖ nonce ‖ be64(generation) ‖ be64(prev) ‖ be64(next)` |
 
-Every answer is signed by the authority key over the label, a hash of the
-request, and the answer. The coordinator checks it with
-`COORDINATOR_AUTHORITY_KEY` from its own measured config, so a network
-attacker can't fake a success or replay an old count.
+`nonce` is 32 fresh random bytes, hex. The answer is
+`{result, generation, count, signature}`. The signature is the authority's
+over `"fount-coordinator-counter/v1/answer\x00" ‖ digest ‖ result ‖ 0x00 ‖
+be64(generation) ‖ be64(count)`. `digest` is
+`sha256("fount-coordinator-counter/v1/request\x00" ‖ op ‖ 0x00 ‖ nonce ‖
+be64(generation) ‖ be64(prev) ‖ be64(next))`. So an answer is bound to one
+request: a replayed or forged answer, success or refusal, doesn't verify.
 
-A `cas` that meets `count == next` with the same `(generation, prev)` as the
-last applied swap answers success, so a retry after a lost answer is
-idempotent. The broker also takes a count ahead of its own, within its own
-generation, as its lost answer (broker `backupcommit.go`).
+| Result | HTTP | Broker error |
+|---|---|---|
+| `ok` | 200 | |
+| `stale_generation`: another generation is current | 409 | `ErrVaultGeneration` |
+| `bad_signature`: the generation is current, the key isn't its | 409 | `ErrVaultGeneration` |
+| `no_generation`: nothing has booted since the register began | 409 | `ErrVaultGeneration` |
+| `count_mismatch`: the count isn't `prev`, or `next ≤ prev` | 409 | `ErrVaultCount` |
+| anything unsigned (503 when the register can't be read or changed, 429, a network error) | | unavailable: retry |
 
-### Replication: read-all, write-all, one serializer
+The checks run in that order, against the head both vaults hold. A cas that
+meets `count == next` where the last state was made by this very
+`(generation, prev, next)` answers `ok`, so a retry after a lost answer is
+idempotent. Only the last swap is answered again. The broker also takes a
+count ahead of its own, within its own generation, as its lost answer
+(`backupcommit.go`). The wire client (`wire.CounterClient`) tries each vault
+in order until one gives a signed answer, and checks that an `ok` cas names
+its generation and `next`.
 
-The register is `(version, generation, coordinator_key, count, last_swap)`.
+## Replication
 
-- **Serializer.** The first vault in `VAULT_PEERS` is the primary. The other
-  forwards every counter call and every boot to it.
-- **Every call needs both vaults, reads included.** The primary applies a
-  change only after the secondary has stored the new register at
-  `version + 1` and acknowledged it, over the attested vault-to-vault pull
-  channel, sealed as the keyset is. A `load` also asks the secondary and
-  answers the higher version. Otherwise a just-promoted upgrade candidate
-  could answer a stale, lower count, which would let a rolled-back volume
-  boot.
-- **Catch-up.** A vault that sees a peer's higher version, from a vault
-  release that verifies, adopts it. Versions only move forward. Every
-  committed change is on both vaults, so after one vault restarts or is
-  upgraded, either vault plus the other's state gives the latest register.
-  The restarted vault won't serve the counter until it has caught up.
-- **Availability cost.** While either vault is down or mid-upgrade, boots,
-  loads and swaps fail. The coordinator already waits for a vault at boot.
-  A security change fails with `ErrNotDurable`, and the client retries.
-  Backups go on, and only their counting waits. A third vault would allow
-  majority quorums, but a compare-and-swap across a majority needs consensus
-  (Paxos or Raft), not just quorum reads and writes. It's out of scope for
-  launch.
-- **Both vaults lost at once.** The register is gone, as the keyset would be.
-  Full recovery already needs the shareholders. The new release sets
-  `GENERATION_FLOOR` and `COUNT_FLOOR` in its measured, public config, from
-  the edge's highest generation and the newest backup's security sequence.
-  The floors are public, so the event can be audited. Whoever sets them could
-  pick a lower count, so after a total loss, rollback protection rests on the
-  operator. That is the residual risk to state publicly.
+*This differs from the first draft, which had the first vault forward every
+call to the second as a single serializer.* With two in-memory nodes and no
+leases, a serializer needs to know it's the serializer. A vault can't tell
+reliably that it's the one at `VAULT_PEERS[0]`: an upgrade candidate is the
+same release on another hostname. And a lease that expires can fork. So the
+register is a hash chain, and the order of the two vaults does the
+serializing.
 
-  A checkpoint of the register in S3, MACed under a vault-only key, wouldn't
-  close this gap: whoever holds the bucket can replay an older version.
+**The register.** A state is `{version, prev, generation, key, count, swap}`.
+`prev` is the hex SHA-256 of the state before, over a fixed binary encoding
+(`register.go`, `hash`). Version 0 is the genesis, with no predecessor.
+A state follows another only as a boot (generation + 1, a 32-byte key, the
+count kept, no swap) or a swap (the same generation and key, count up, and
+`swap` naming the cas). Each vault keeps its last 64 states.
 
-### Broker side, once this lands
+**Taking a state.** A vault takes a chain only if it extends the head it
+holds: it starts from the head, or links to it. So it takes at most one
+successor of any state. A chain whose tip it already holds is accepted again
+(a repeated delivery). Anything else is rejected, and nothing changes.
 
-- `vaultkey.Fetch` sends the boot's `coordinator_key`, and keeps
-  `generation_certificate` and `S3` from the payload.
-- A `vaultcounter` client implements `coordinator.VaultCounter` against
-  `/coordinator/counter`, verifying the vault's signatures.
-- `--wrapping-key vault` then takes `--backup-bucket`, using the bucket
-  credentials from the vault (`vaultctl import-s3`) instead of the
-  environment.
+**A change.** Whichever vault handles a call (a boot, a load, a cas):
 
-## Size
+1. Reads both hosts' heads: `https://VAULT_PEERS[0]` and `[1]`, at
+   `/register/head`. Both must answer, from two different instances. Each
+   process draws an instance ID, so one vault answering for both hostnames is
+   refused.
+2. Settles them:
+   - Equal, it goes on.
+   - One behind and in the other's history (a change cut short, a restart, a
+     promoted candidate), it pushes the missing states to the one behind.
+   - Two different states at one version, or a gap wider than the history:
+     **diverged**, refused until an operator restarts one vault.
+3. Decides the next state from the settled head, if any. A load stops here.
+4. Applies `[head, next]` to `VAULT_PEERS[0]`, then, only if that vault
+   accepted, to `VAULT_PEERS[1]`. Each must accept, from the instance it read.
+5. Answers only then. Within one process a mutex runs changes one at a time.
 
-These parts are new in this repo:
+Two changes racing from different vaults both try `VAULT_PEERS[0]` first, so
+at most one wins there. The loser stops before `VAULT_PEERS[1]`. The winner's
+change can't be refused at `VAULT_PEERS[1]` by the loser, which never got
+there. A change cut short, accepted by `VAULT_PEERS[0]` and not
+`VAULT_PEERS[1]`, was never answered, and the next settle finishes it: a lost
+answer, which the coordinator already handles.
 
-- a third secret, with its commitment and its transfer rules;
-- a Cloud mode;
-- the boot exchange;
-- a replicated register with catch-up, including the upgrade candidate;
-- two signed endpoints;
-- drills for a vault restart, an upgrade with a swap in flight, and total
-  loss with floors.
+**Peer authentication.** `/register/head` and `/register/apply` take
+`{body, mac}`. The MAC is HMAC-SHA256 under
+`HKDF-SHA256(seed, info "fount-coordinator-register/peer/v1")` over the path
+and the body. The answer's MAC also covers the SHA-256 of the request body.
+Only a vault holding the generation keyset can make or answer one. Nothing on
+this path is secret, so nothing is sealed. TLS through the shim keeps it from
+the network. The MAC keeps out everyone else who can reach the shim.
 
-It changes the deployed vault's security core, so it belongs in its own lane
-and review, not as a counter endpoint added on the side.
+**Syncing.** Every 15 s a Cloud vault settles both hosts, and brings its own
+copy up. So a held upgrade candidate tracks production. Its last sync shows
+on `/status` under `coordinator.last_sync`, with the register's version, head
+hash, generation and count.
+
+**Pulled registers.** A vault takes a register only with the generation
+keyset, only from a vault, and only at or above its release's floors.
+
+### When a vault is down or mid-upgrade
+
+Every call needs both vaults, loads included. Otherwise a vault restored from
+a stale peer could answer a lower count, which would let a rolled-back volume
+boot. While either vault is down, boots, loads and swaps answer an unsigned
+503. The coordinator waits for a vault at boot, and the broker retries a
+security change (`ErrNotDurable`). Backups go on, and only their counting
+waits.
+
+- **A restart.** The restarted vault pulls the keyset, the generation keyset
+  and the register from its peer. The next call or sync settles both.
+- **An upgrade** (`--hold=true`, then promote). The candidate pulls from a
+  production vault, then follows both by sync while held. A call it handles
+  reads both production vaults, like any vault. On promote, the next settle
+  brings it up if anything changed since its last sync.
+- **A rollback window, and the rule that closes it.** Suppose a candidate
+  promoted with a stale register replaced one vault, and *then* the other
+  vault restarted before any settle. The restarted vault would pull the stale
+  register, and changes made in that gap would be lost. So, for each vault in
+  turn:
+  1. Promote it.
+  2. Wait until both vaults' `/status` show the same `coordinator.register`
+     head.
+  3. Only then touch the other vault.
+
+  The same rule applies to restarting a vault by hand.
+- **Diverged.** This shouldn't happen. It would take someone replaying a
+  captured `/register/apply` inside TLS, or both vaults taking different
+  states some other way. It is refused until one vault is restarted, which
+  then pulls the other's register. Pick the vault whose `/status` shows the
+  higher count. A change on the other branch was never answered.
+
+A third vault would allow majority quorums. A compare-and-swap across a
+majority needs consensus, though, so that's out of scope for launch.
+
+### Both vaults lost
+
+The register and the generation keyset are gone, as the keyset would be.
+Full recovery already needs the shareholders:
+
+1. Restore the keyset from shares as usual.
+2. Run a generating release (`GENERATION_AUTHORITY_KEY` empty), with
+   `GENERATION_FLOOR` at least the edge's highest generation, and
+   `COUNT_FLOOR` at least the newest backup's security sequence.
+3. Release the pair with the new authority key and the same floors.
+4. Release the edge and the coordinator's config with the new key.
+
+The floors are public, so the event can be audited. Whoever sets them could
+pick a lower count, so after a total loss, rollback protection rests on the
+operator. That residual risk is stated publicly. A floor above the register
+a peer offers makes a release refuse that register, so a raised floor can't
+be undone by a peer.
+
+A checkpoint of the register in S3, MACed under a vault-only key, wouldn't
+close the gap: whoever holds the bucket can replay an older version.
+
+## What each party holds
+
+| Party | Holds |
+|---|---|
+| Each Cloud vault (in memory) | The keyset, the S3 credentials, the generation keyset (authority seed), the register's last 64 states |
+| The coordinator (in memory) | The keyset (its wrapping key), the S3 credentials, its per-boot key and certificate |
+| Measured release configs (public) | The keyset commitment, the authority public key (vault, edge, coordinator), the floors |
+| The edge | The authority public key, and the highest generation it has seen |
+
+## Broker side
+
+- `vaultkey.Fetch` boots: it sends a fresh `coordinator_key` and keeps the
+  certificate, the generation key and the S3 credentials.
+- `vaultcounter` implements `coordinator.VaultCounter` with
+  `wire.CounterClient`.
+- `--wrapping-key vault` takes `--backup-bucket` once
+  `--coordinator-authority-key` is set. It uses the bucket credentials from
+  the vault (`vaultctl import-s3`), not the environment.
+
+## Drills before launch
+
+- Restart each vault in turn while the coordinator swaps.
+- Upgrade each vault (hold, sync, promote, wait for equal heads) with a swap
+  in flight.
+- Kill one vault for a while: everything refuses, and nothing forks.
+- Total loss with floors, on a scratch pair.

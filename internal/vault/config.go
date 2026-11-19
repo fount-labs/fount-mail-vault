@@ -29,6 +29,21 @@ type Config struct {
 	Recipients     []string // RECOVERY_RECIPIENTS: age X25519 recipients, one share each
 	Threshold      int      // RECOVERY_THRESHOLD: shares needed to restore
 	OperatorKey    ed25519.PublicKey
+
+	// CoordinatorMode is COORDINATOR_MODE=1: this is the Cloud vault pair,
+	// its EDGE_REPO is the coordinator's config repo, and it keeps the
+	// generation keyset and the coordinator's register
+	// (docs/COORDINATOR-COUNTER.md).
+	CoordinatorMode bool
+	// GenerationKey is GENERATION_AUTHORITY_KEY, the generation keyset's
+	// public key, base64: empty only in a release that may generate one.
+	GenerationKey string
+	// GenerationFloor and CountFloor are GENERATION_FLOOR and COUNT_FLOOR:
+	// where a new register starts, at /generate-generation, and below which
+	// no register is taken. Required in coordinator mode, even as 0, so a
+	// release after a total loss can't forget them.
+	GenerationFloor uint64
+	CountFloor      uint64
 }
 
 // LoadConfig fails on anything missing or malformed, because a vault that boots
@@ -95,7 +110,48 @@ func LoadConfig(getenv func(string) string) (*Config, error) {
 		return nil, fmt.Errorf("OPERATOR_KEY must be a hex Ed25519 public key")
 	}
 	c.OperatorKey = raw
+	if err := c.loadCoordinator(getenv); err != nil {
+		return nil, err
+	}
 	return c, nil
+}
+
+// loadCoordinator reads the Cloud vault's settings. A mail vault sets none of
+// them.
+func (c *Config) loadCoordinator(getenv func(string) string) error {
+	mode := getenv("COORDINATOR_MODE")
+	c.GenerationKey = getenv("GENERATION_AUTHORITY_KEY")
+	floor, count := getenv("GENERATION_FLOOR"), getenv("COUNT_FLOOR")
+	switch mode {
+	case "":
+		if c.GenerationKey != "" || floor != "" || count != "" {
+			return fmt.Errorf("GENERATION_AUTHORITY_KEY, GENERATION_FLOOR and COUNT_FLOOR need COORDINATOR_MODE=1")
+		}
+		return nil
+	case "1":
+		c.CoordinatorMode = true
+		if len(c.Peers) != 2 {
+			return fmt.Errorf("COORDINATOR_MODE needs exactly two VAULT_PEERS: the register lives on both")
+		}
+	default:
+		return fmt.Errorf("COORDINATOR_MODE must be 1 or unset, got %q", mode)
+	}
+	if c.GenerationKey != "" {
+		if _, err := wire.ParseAuthorityKey(c.GenerationKey); err != nil {
+			return fmt.Errorf("GENERATION_AUTHORITY_KEY: %w", err)
+		}
+		if c.Commitment == "" {
+			return fmt.Errorf("GENERATION_AUTHORITY_KEY is set but KEYSET_COMMITMENT isn't")
+		}
+	}
+	var err error
+	if c.GenerationFloor, err = strconv.ParseUint(floor, 10, 63); err != nil {
+		return fmt.Errorf("GENERATION_FLOOR must be a number, 0 for a first register, got %q", floor)
+	}
+	if c.CountFloor, err = strconv.ParseUint(count, 10, 63); err != nil {
+		return fmt.Errorf("COUNT_FLOOR must be a number, 0 for a first register, got %q", count)
+	}
+	return nil
 }
 
 // vaultPin and edgePin accept any witnessed release of the repo. The minimum tags

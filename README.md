@@ -18,8 +18,8 @@ vault-a <-> vault-b       restore each other; both verify
 
 | Path | What it is |
 |---|---|
-| `wire/` | A nested module, standard library only: the keyset and the send keyset, their commitments, the sealed box, and the pull protocol. The edge imports it |
-| `internal/vault` | The server: generate, transfer with pins and minimum tags, restore from peers, recovery, and S3 import |
+| `wire/` | A nested module, standard library only: the keyset, the send keyset and the generation keyset, their commitments, the sealed box, the pull protocol, generation certificates and the counter client. The edge and the coordinator import it |
+| `internal/vault` | The server: generate, transfer with pins and minimum tags, restore from peers, recovery, and S3 import; in Cloud mode, coordinator generations and the counter (`register.go`, `counter.go`) |
 | `internal/shamir` | Shamir's scheme over GF(256), constant-time |
 | `internal/recovery` | The recovery bundle: one age-encrypted share per recipient |
 | `internal/opclient`, `cmd/vaultctl` | The operator's tool |
@@ -48,6 +48,9 @@ missing or malformed.
 | `VAULT_PEERS` | Both vault hostnames. Pulling from itself just fails |
 | `RECOVERY_RECIPIENTS`, `RECOVERY_THRESHOLD` | age X25519 recipients, one share each, and how many shares restore |
 | `OPERATOR_KEY` | Ed25519 public key that signs S3 credential imports |
+| `COORDINATOR_MODE` | `1` only on the Cloud vault pair, whose `EDGE_REPO` is the coordinator's config repo. Needs exactly two `VAULT_PEERS`. See `docs/COORDINATOR-COUNTER.md` |
+| `GENERATION_AUTHORITY_KEY` | Cloud only. Empty only in the release that generates the generation keyset. It's the same string as the edge's `COORDINATOR_AUTHORITY_KEY` |
+| `GENERATION_FLOOR`, `COUNT_FLOOR` | Cloud only, required. Where the register starts when the generation keyset is generated, and the lowest register a release takes from a peer |
 
 ## Bootstrap
 
