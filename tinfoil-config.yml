@@ -1,7 +1,7 @@
 # Fount Mail vault: holds the keyset in enclave memory and hands it only to
 # verified vaults and edges. See README.md. Everything here is measured, so every
 # value is public, and changing one takes a new release.
-cvm-version: 0.14.17 # https://github.com/tinfoilsh/cvmimage/releases/latest, no `v`
+cvm-version: 0.14.19 # https://github.com/tinfoilsh/cvmimage/releases/latest, no `v`
 cpus: 2
 memory: 4096
 

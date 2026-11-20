@@ -25,3 +25,23 @@ func (s *Server) ForceSendKeyset(k *wire.SendKeyset) {
 
 // RestoreFromPeers runs the restore loop once to completion or until ctx ends.
 func (s *Server) RestoreFromPeers(ctx context.Context) { s.restoreLoop(ctx) }
+
+// RegisterHead is this vault's own register head.
+func (s *Server) RegisterHead() (version, generation, count uint64, ok bool) {
+	h, ok := s.reg.head()
+	return h.Version, h.Generation, h.Count, ok
+}
+
+// ForceRegisterSwap moves this vault's own register to count next, as a
+// change cut short after the first vault took it would.
+func (s *Server) ForceRegisterSwap(next uint64) (string, error) {
+	h, _ := s.reg.head()
+	n := regState{Version: h.Version + 1, Prev: h.hash(), Generation: h.Generation, Key: h.Key, Count: next, Swap: &regSwap{h.Generation, h.Count, next}}
+	return s.reg.apply([]regState{h, n})
+}
+
+// SyncOnce is one round of the sync loop.
+func (s *Server) SyncOnce(ctx context.Context) error {
+	_, _, err := s.settle(ctx)
+	return err
+}
