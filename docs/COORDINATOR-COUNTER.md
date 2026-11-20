@@ -46,8 +46,10 @@ below (409) and a boot (403), and a mail vault behaves exactly as before.
 Cloud mode needs exactly two `VAULT_PEERS`, and `GENERATION_FLOOR` and
 `COUNT_FLOOR` (decimal, below 2^63).
 
-The Cloud pair's own `tinfoil-config.yml` (not this repo's, which is the
-mail pair's) sets, beyond the mail vault's values:
+The Cloud pair's own `tinfoil-config.yml` (not this repo's root one, which is
+the mail pair's; it's kept here as `cloud/tinfoil-config.yml`, for the
+`fount-labs/fount-cloud-vault` repo to release from its root) sets, beyond
+the mail vault's values:
 
 ```yaml
 - EDGE_REPO: "<the coordinator's config repo>"
