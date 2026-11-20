@@ -1,0 +1,68 @@
+# Fount Cloud vault pair: the same vault image in COORDINATOR_MODE, holding the
+# coordinator's keyset (its wrapping key), the backup bucket's credentials, the
+# generation keyset and the rollback counter's register. See
+# docs/COORDINATOR-COUNTER.md. This is the config for the public
+# fount-labs/fount-cloud-vault repo, which releases it from its root: the Cloud
+# pair takes peers only from its own VAULT_REPO, so mail and Cloud keys never
+# mix. Everything here is measured, so every value is public, and changing one
+# takes a new release.
+cvm-version: 0.14.17 # https://github.com/tinfoilsh/cvmimage/releases/latest, no `v`
+cpus: 2
+memory: 4096
+
+attested-keys:
+  - id: transfer # x25519: keysets, shares, and imports are sealed to this
+    key: x25519
+
+networks:
+  # A vault calls both VAULT_PEERS, itself included, through the shim, and has
+  # to boot while its peer doesn't exist; see the mail pair's tinfoil-config.yml.
+  peers:
+    egress: open
+
+containers:
+  - name: vault
+    image: "ghcr.io/fount-labs/fount-mail-vault@sha256:PLACEHOLDER_DIGEST" # from Build Image, a release with COORDINATOR_MODE
+    networks: [peers]
+    keys: [transfer]
+    attestation: true
+    restart: always
+    healthcheck:
+      test: ["CMD", "/vault", "health"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 1m
+    ports: ["8080:8080"]
+    env:
+      - VAULT_REPO: "fount-labs/fount-cloud-vault"
+      - EDGE_REPO: "PLACEHOLDER_COORDINATOR_REPO" # the real coordinators' config repo, owner/repo; never fount-cloud-coordinator, the test repo
+      - EDGE_MIN_TAG: "v0.1.0" # the coordinator repo's first release with the vault boot; raise to retire old ones
+      - KEYSET_COMMITMENT: "" # empty only in the release that generates; see README
+      - SEND_KEYSET_COMMITMENT: "" # the Cloud pair holds no send keyset
+      - VAULT_PEERS: "cloud-vault-a.fount.containers.tinfoil.dev,cloud-vault-b.fount.containers.tinfoil.dev"
+      - RECOVERY_RECIPIENTS: "age1fuy00zm6yjuygfxxng6tsnugy2qkc0qdsfqcxer2p3um6u2a347slrf550,age1w8709c8vfnrevkmlz75n34n074elz4tgv220jx9vlf4qfsu3ruksaelxer" # the mail pair's holders
+      - RECOVERY_THRESHOLD: "1"
+      - OPERATOR_KEY: "6b8cebf9ea0a064955b8673b49d715d70be2265b89c025b483a8e8ceec4ae986" # the mail pair's; signs vaultctl import-s3
+      - COORDINATOR_MODE: "1"
+      - GENERATION_AUTHORITY_KEY: "" # empty only in the release that runs /generate-generation; then the edge's COORDINATOR_AUTHORITY_KEY
+      - GENERATION_FLOOR: "0" # a first register; after a total loss, at least the edge's highest generation
+      - COUNT_FLOOR: "0" # a first register; after a total loss, at least the newest backup's security sequence
+
+shim:
+  upstream-port: 8080
+  paths:
+    - /health
+    - /status
+    - /generate
+    - /generate-send
+    - /transfer/begin
+    - /transfer/finish
+    - /recovery/bundle
+    - /recovery/share
+    - /operator/begin
+    - /operator/import
+    - /generate-generation
+    - /coordinator/counter
+    - /register/head
+    - /register/apply
