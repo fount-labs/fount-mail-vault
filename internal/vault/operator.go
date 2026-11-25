@@ -139,7 +139,7 @@ func (s *Server) handleShare(w http.ResponseWriter, r *http.Request) {
 	}
 	slot := s.recipientSlot(req.SenderKey)
 	if slot == 0 {
-		writeError(w, http.StatusForbidden, errors.New("refused at sender: a share must be sealed from a RECOVERY_RECIPIENTS identity"))
+		writeError(w, http.StatusForbidden, errors.New("refused at sender: a share must be sealed from a RECOVERY_RECIPIENTS identity; a vaultctl older than this vault seals from a throwaway key, so upgrade vaultctl"))
 		return
 	}
 	// The place is taken before the box is opened, under the lock, so
