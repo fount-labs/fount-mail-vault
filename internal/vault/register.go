@@ -77,6 +77,11 @@ type regState struct {
 	Key   []byte   `json:"key,omitempty"`
 	Count uint64   `json:"count"`
 	Swap  *regSwap `json:"swap,omitempty"`
+	// Digest and Writer are the counted state's digest and the generation
+	// whose version 2 cas set them; a boot keeps them. Empty and 0 for a
+	// count set by a version 1 cas or the floors.
+	Digest string `json:"digest,omitempty"`
+	Writer uint64 `json:"writer,omitempty"`
 }
 
 // regSwap is the cas that made a state, so a retry after a lost answer is
@@ -108,6 +113,15 @@ func (s regState) hash() string {
 		b = binary.BigEndian.AppendUint64(b, s.Swap.Prev)
 		b = binary.BigEndian.AppendUint64(b, s.Swap.Next)
 	}
+	// Only a state a version 2 cas counted has these, so every other
+	// state hashes as it did before, and vaults that predate version 2
+	// still agree with this one on them.
+	if s.Digest != "" || s.Writer != 0 {
+		d, _ := hex.DecodeString(s.Digest)
+		b = append(b, 2, byte(len(d)))
+		b = append(b, d...)
+		b = binary.BigEndian.AppendUint64(b, s.Writer)
+	}
 	h.Write(b)
 	return hex.EncodeToString(h.Sum(nil))
 }
@@ -123,6 +137,9 @@ func (s regState) valid() error {
 	if len(s.Key) != 0 && len(s.Key) != 32 {
 		return errors.New("a state's key is 32 bytes")
 	}
+	if (s.Digest == "") != (s.Writer == 0) || (s.Digest != "" && !wire.ValidStateDigest(s.Digest)) {
+		return errors.New("a state's digest is 32 bytes, with the generation that wrote it")
+	}
 	if s.Swap != nil && (s.Swap.Generation != s.Generation || s.Swap.Next != s.Count || s.Swap.Next <= s.Swap.Prev) {
 		return errors.New("a state's swap doesn't match it")
 	}
@@ -136,12 +153,15 @@ func step(a, b regState) error {
 	}
 	switch {
 	case b.Generation == a.Generation+1:
-		if len(b.Key) != 32 || b.Count != a.Count || b.Swap != nil {
+		if len(b.Key) != 32 || b.Count != a.Count || b.Swap != nil || a.Digest != b.Digest || a.Writer != b.Writer {
 			return fmt.Errorf("state %d boots a generation but changes more", b.Version)
 		}
 	case b.Generation == a.Generation:
 		if len(a.Key) != 32 || !bytes.Equal(a.Key, b.Key) || b.Swap == nil || b.Swap.Prev != a.Count || b.Count <= a.Count {
 			return fmt.Errorf("state %d isn't a swap of state %d", b.Version, a.Version)
+		}
+		if b.Digest != "" && b.Writer != b.Generation {
+			return fmt.Errorf("state %d's digest names generation %d as its writer", b.Version, b.Writer)
 		}
 		if b.Count > wire.MaxCount || b.Count-a.Count > wire.MaxCountStep {
 			return fmt.Errorf("state %d moves the count from %d to %d, past the bounds", b.Version, a.Count, b.Count)

@@ -923,6 +923,56 @@ func (c *cloud) boots(host string) bootsStatus {
 	return st.Coordinator.Boots
 }
 
+// Broker review H2: the count bound a number, not a state, so a fenced
+// generation's disk at seq == count passed. Version 2 counts a state digest
+// and its writer's generation, and a boot keeps them.
+func TestCloudCounterBindsAState(t *testing.T) {
+	c := newCloud(t, 0, 0)
+	gen1 := c.mustBoot("coordinator-1", hostA)
+	d1, d2 := strings.Repeat("11", 32), strings.Repeat("22", 32)
+	if _, err := c.counter(hostA).CompareAndSwapState(context.Background(), gen1.gen, 1, 0, 1, d1); err != nil {
+		t.Fatal(err)
+	}
+	want := wire.CounterState{Generation: 1, Count: 1, StateDigest: d1, Writer: 1}
+	if st, err := c.counter(hostB).LoadState(context.Background()); err != nil || st != want {
+		t.Fatalf("a version 2 load: %+v %v", st, err)
+	}
+	// A version 1 load is as it was.
+	if st := c.load(hostA); st != (wire.CounterState{Generation: 1, Count: 1}) {
+		t.Fatalf("a version 1 load: %+v", st)
+	}
+	// A retry of the last swap with another state is no retry.
+	if _, err := c.counter(hostA).CompareAndSwapState(context.Background(), gen1.gen, 1, 0, 1, d2); !errors.Is(err, wire.ErrCounterCount) {
+		t.Fatalf("the last swap again with another digest: %v", err)
+	}
+	if _, err := c.counter(hostA).CompareAndSwapState(context.Background(), gen1.gen, 1, 0, 1, d1); err != nil {
+		t.Fatalf("the last swap again: %v", err)
+	}
+	// The digest is signed: one swapped in transit doesn't verify.
+	nonce, _ := wire.RandomNonce()
+	req := wire.CounterRequest{Op: wire.CounterCAS, Nonce: hex.EncodeToString(nonce), Generation: 1, Prev: 1, Next: 2, Version: 2, StateDigest: d2,
+		Signature: ed25519.Sign(gen1.gen, wire.CASMessageV2(nonce, 1, 1, 2, d1))}
+	if status, out := c.post("https://"+hostA, wire.CounterPath, req); status != http.StatusConflict || !strings.Contains(string(out), wire.CounterBadSignature) {
+		t.Fatalf("a swapped digest answered %d: %s", status, out)
+	}
+	// A boot keeps the counted state and who wrote it.
+	c.mustBoot("coordinator-2", hostB)
+	want.Generation = 2
+	if st, err := c.counter(hostA).LoadState(context.Background()); err != nil || st != want {
+		t.Fatalf("after a boot: %+v %v", st, err)
+	}
+	// A restarted vault pulls it with the register.
+	b2 := c.node("vault-b-2", "v0.3.0", c.authority, 0, 0)
+	if err := b2.s.PullFrom(context.Background(), "https://"+hostA); err != nil {
+		t.Fatal(err)
+	}
+	c.r.set(hostB, b2.ts)
+	c.nodes["vault-b"] = b2
+	if st, err := c.counter(hostB).LoadState(context.Background()); err != nil || st != want {
+		t.Fatalf("after vault-b restarted: %+v %v", st, err)
+	}
+}
+
 func TestCloudConcurrentSwapsDontFork(t *testing.T) {
 	c := newCloud(t, 0, 0)
 	gen1 := c.mustBoot("coordinator-1", hostA)
