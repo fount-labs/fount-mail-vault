@@ -14,7 +14,10 @@ import (
 
 // The Cloud vault's generation and counter (docs/COORDINATOR-COUNTER.md).
 
-const maxCounterCalls = 16
+const (
+	maxCounterCalls   = 16
+	loadSettleTimeout = 30 * time.Second
+)
 
 var errNotCloud = errors.New("this vault isn't a Cloud vault (COORDINATOR_MODE)")
 
@@ -140,13 +143,6 @@ func (s *Server) handleCounter(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusConflict, err)
 		return
 	}
-	select {
-	case s.counterCalls <- struct{}{}:
-		defer func() { <-s.counterCalls }()
-	default:
-		writeError(w, http.StatusTooManyRequests, errTooMany)
-		return
-	}
 	var req wire.CounterRequest
 	if !decode(w, r, wire.MaxCounterBody, &req) {
 		return
@@ -156,13 +152,24 @@ func (s *Server) handleCounter(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, err)
 		return
 	}
+	// A load is unauthenticated, so loads share settles rather than slots:
+	// a flood of them can't take the slots a swap needs (review L4).
+	if req.Op == wire.CounterCAS {
+		select {
+		case s.counterCalls <- struct{}{}:
+			defer func() { <-s.counterCalls }()
+		default:
+			writeError(w, http.StatusTooManyRequests, errTooMany)
+			return
+		}
+	}
 	var (
 		result string
 		st     wire.CounterState
 	)
 	switch req.Op {
 	case wire.CounterLoad:
-		head, _, err := s.settle(r.Context())
+		head, err := s.sharedSettle(r.Context())
 		if err != nil {
 			s.unavailable(w, err)
 			return
@@ -200,6 +207,53 @@ func (s *Server) handleCounter(w http.ResponseWriter, r *http.Request) {
 		status = http.StatusConflict
 	}
 	writeJSON(w, status, wire.AnswerCounter(g.Authority(), &req, result, st))
+}
+
+// loadFlight is one settle that loads share.
+type loadFlight struct {
+	done chan struct{}
+	head regState
+	err  error
+}
+
+// sharedSettle is settle for a load. Every load that arrives while a settle
+// runs waits for the next one, which starts after they all arrived, so each
+// still sees a head at least as new as its own arrival; at most two settles
+// for loads run at once, however many loads come.
+func (s *Server) sharedSettle(ctx context.Context) (regState, error) {
+	s.loadMu.Lock()
+	if s.loadNext == nil {
+		s.loadNext = &loadFlight{done: make(chan struct{})}
+	}
+	f := s.loadNext
+	if !s.loadRunning {
+		s.startLoadLocked()
+	}
+	s.loadMu.Unlock()
+	select {
+	case <-f.done:
+		return f.head, f.err
+	case <-ctx.Done():
+		return regState{}, ctx.Err()
+	}
+}
+
+// startLoadLocked runs loadNext. Called with loadMu held.
+func (s *Server) startLoadLocked() {
+	f := s.loadNext
+	s.loadNext, s.loadRunning = nil, true
+	go func() {
+		ctx, cancel := context.WithTimeout(context.Background(), loadSettleTimeout)
+		f.head, _, f.err = s.settle(ctx)
+		cancel()
+		close(f.done)
+		s.loadMu.Lock()
+		s.loadRunning = false
+		if s.loadNext != nil {
+			s.startLoadLocked()
+		}
+		s.loadMu.Unlock()
+	}()
 }
 
 func (s *Server) unavailable(w http.ResponseWriter, err error) {

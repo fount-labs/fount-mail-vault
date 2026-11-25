@@ -45,3 +45,12 @@ func (s *Server) SyncOnce(ctx context.Context) error {
 	_, _, err := s.settle(ctx)
 	return err
 }
+
+// ShrinkSpent sets every spent class's budget to n, so a test can fill one.
+func (s *Server) ShrinkSpent(n int) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for _, p := range s.spent {
+		p.max = n
+	}
+}

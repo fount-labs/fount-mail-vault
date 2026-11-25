@@ -91,13 +91,23 @@ func (s *Server) openSealed(w http.ResponseWriter, req SealedRequest, p wire.Pur
 		writeError(w, http.StatusBadRequest, err)
 		return nil, false
 	}
-	if err := s.consumeNonce(req.Nonce, useOperator); err != nil {
+	expires, err := s.checkNonce(req.Nonce, useOperator)
+	if err != nil {
 		s.refuse(w, "nonce", err)
 		return nil, false
 	}
 	plaintext, err := wire.Open(p, s.transfer, sender, wire.Nonces{Issued: issued, Answer: answer}, req.Sealed)
 	if err != nil {
 		s.refuse(w, "open", err)
+		return nil, false
+	}
+	class := spentShare
+	if p == wire.PurposeImport {
+		class = spentImport
+	}
+	if err := s.spend(req.Nonce, expires, class); err != nil {
+		clear(plaintext)
+		s.refuse(w, "nonce", err)
 		return nil, false
 	}
 	return plaintext, true

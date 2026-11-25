@@ -709,6 +709,100 @@ func TestCloudSwapsAreBounded(t *testing.T) {
 	c.level(wire.CounterState{Generation: 1, Count: wire.MaxCountStep})
 }
 
+// Review H1: 256 unauthenticated begins every two minutes used to refuse
+// every pull, so a restarted vault couldn't restore, no coordinator could
+// boot, and the operator couldn't import.
+func TestCloudBeginFloodBlocksNothing(t *testing.T) {
+	c := newCloud(t, 0, 0)
+	for _, name := range []string{"vault-a", "vault-b"} {
+		c.nodes[name].s.ShrinkSpent(32)
+	}
+	edgeDoc := fakeAttester{"coordinator-public"}
+	c.f.w.enroll(coordRepo, "coordinator-public", "v1.0.0")
+	var wg sync.WaitGroup
+	for _, host := range []string{hostA, hostB} {
+		for range 8 {
+			wg.Go(func() {
+				for range 100 {
+					if status, out := c.post("https://"+host, "/transfer/begin", nil); status != http.StatusOK {
+						t.Errorf("begin answered %d: %s", status, out)
+						return
+					}
+					answer, _ := wire.RandomNonce()
+					c.post("https://"+host, "/operator/begin", vault.OperatorBeginRequest{AnswerNonce: hex.EncodeToString(answer)})
+				}
+			})
+		}
+		// Pulls with a public document, more than the pull budget: they
+		// evict each other, and nothing else.
+		for range 64 {
+			var begun wire.BeginResponse
+			if err := wire.PostJSON(context.Background(), c.r.client(), "https://"+host+"/transfer/begin", nil, &begun); err != nil {
+				t.Fatal(err)
+			}
+			issued, _ := wire.DecodeNonce(begun.Nonce)
+			answer, _ := wire.RandomNonce()
+			doc, _ := edgeDoc.Attest(context.Background(), issued)
+			if status, out := c.post("https://"+host, "/transfer/finish", wire.FinishRequest{Nonce: begun.Nonce, AnswerNonce: hex.EncodeToString(answer), Document: doc}); status != http.StatusOK {
+				t.Fatalf("a public pull answered %d: %s", status, out)
+			}
+		}
+	}
+	wg.Wait()
+
+	// vault-b restarts mid-flood and restores from vault-a.
+	b2 := c.node("vault-b-2", "v0.3.0", c.authority, 0, 0)
+	b2.s.ShrinkSpent(32)
+	if err := b2.s.PullFrom(context.Background(), "https://"+hostA); err != nil {
+		t.Fatalf("a restore during the flood: %v", err)
+	}
+	c.r.set(hostB, b2.ts)
+	c.nodes["vault-b"] = b2
+	// A coordinator boots, and the operator imports.
+	c.mustBoot("coordinator-1", hostA)
+	c.mustBoot("coordinator-2", hostB)
+	op := c.f.operatorClient(&node{}, "vault-a")
+	op.HTTP, op.Base = c.r.client(), "https://"+hostA
+	if err := op.ImportS3(context.Background(), wire.S3Credentials{AccessKeyID: "AKID", SecretAccessKey: "secret"}, c.f.operator); err != nil {
+		t.Fatalf("an import during the flood: %v", err)
+	}
+}
+
+// Review L4: loads took the counter's 16 slots, so a load flood made a
+// coordinator's swaps 429, and every security change ErrNotDurable.
+func TestCloudLoadFloodLeavesSwaps(t *testing.T) {
+	c := newCloud(t, 0, 0)
+	gen1 := c.mustBoot("coordinator-1", hostA)
+	stop := make(chan struct{})
+	var wg sync.WaitGroup
+	for range 64 {
+		wg.Go(func() {
+			for {
+				select {
+				case <-stop:
+					return
+				default:
+				}
+				nonce, _ := wire.RandomNonce()
+				if status, out := c.post("https://"+hostA, wire.CounterPath, wire.CounterRequest{Op: wire.CounterLoad, Nonce: hex.EncodeToString(nonce)}); status != http.StatusOK {
+					t.Errorf("a load in the flood answered %d: %s", status, out)
+					return
+				}
+			}
+		})
+	}
+	for i := range uint64(10) {
+		if err := c.cas(gen1, hostA, 1, i, i+1); err != nil {
+			t.Errorf("swap %d during a load flood: %v", i, err)
+		}
+		if st := c.load(hostB); st.Count != i+1 {
+			t.Errorf("a load after swap %d: %+v", i, st)
+		}
+	}
+	close(stop)
+	wg.Wait()
+}
+
 func TestCloudConcurrentSwapsDontFork(t *testing.T) {
 	c := newCloud(t, 0, 0)
 	gen1 := c.mustBoot("coordinator-1", hostA)

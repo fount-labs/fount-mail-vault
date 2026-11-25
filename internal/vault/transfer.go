@@ -57,7 +57,8 @@ func (s *Server) handleFinish(w http.ResponseWriter, r *http.Request) {
 		coordinatorKey = req.CoordinatorKey
 		attested = wire.BootNonce(issued, coordinatorKey)
 	}
-	if err := s.consumeNonce(req.Nonce, useTransfer); err != nil {
+	expires, err := s.checkNonce(req.Nonce, useTransfer)
+	if err != nil {
 		s.refuse(w, "nonce", err)
 		return
 	}
@@ -84,11 +85,17 @@ func (s *Server) handleFinish(w http.ResponseWriter, r *http.Request) {
 	// holds it: anyone can fetch a genuine coordinator's document for a nonce
 	// of their choosing. Nothing moves the register until the proof shows
 	// the sender holds that key.
+	class := spentPull
 	if coordinatorKey != nil {
 		if err := wire.VerifyBootProof(s.transfer, peer.Key, nonces, coordinatorKey, req.BootProof); err != nil {
 			s.refuse(w, "boot proof", err)
 			return
 		}
+		class = spentBoot
+	}
+	if err := s.spend(req.Nonce, expires, class); err != nil {
+		s.refuse(w, "nonce", err)
+		return
 	}
 
 	s.mu.Lock()

@@ -3,7 +3,10 @@ package vault
 import (
 	"context"
 	"crypto/ecdh"
+	"crypto/hmac"
 	"crypto/rand"
+	"crypto/sha256"
+	"encoding/binary"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -20,7 +23,8 @@ import (
 
 const (
 	nonceLifetime  = 2 * time.Minute
-	maxNonces      = 256
+	maxSpentPulls  = 1 << 14
+	maxSpentStrict = 1 << 12
 	maxRefusals    = 20
 	maxPending     = 32
 	selfCheckEvery = time.Hour
@@ -54,10 +58,25 @@ const (
 	useOperator nonceUse = "operator"
 )
 
-type issuedNonce struct {
-	use     nonceUse
-	expires time.Time
-}
+// nonceUseByte is a nonce's first byte, so a nonce says what it was issued for.
+var nonceUseByte = map[nonceUse]byte{useTransfer: 1, useOperator: 2}
+
+// spentClass is where a consumed nonce is kept until it expires. Each class
+// has its own budget, so a flood of one can't refuse another.
+type spentClass string
+
+const (
+	// spentPull is a pull's: it has no side effect, and the box is sealed to
+	// the attested key, so replaying an evicted one gives nobody anything.
+	// The oldest is evicted when it's full.
+	spentPull spentClass = "pull"
+	// spentBoot, spentShare and spentImport have side effects, and are kept
+	// until they expire. Only a boot proof, an opened share box or an
+	// operator signature gets a nonce into one.
+	spentBoot   spentClass = "boot"
+	spentShare  spentClass = "share"
+	spentImport spentClass = "import"
+)
 
 type refusal struct {
 	At     time.Time `json:"at"`
@@ -84,7 +103,8 @@ type Server struct {
 	source      string
 	sendKeyset  *wire.SendKeyset
 	sendSource  string
-	nonces      map[string]issuedNonce
+	nonceKey    []byte
+	spent       map[spentClass]*spentSet
 	refusals    []refusal
 	lastPeer    *peerRecord
 	self        *attest.Peer
@@ -103,22 +123,35 @@ type Server struct {
 	instance     string
 	proposeMu    sync.Mutex
 	counterCalls chan struct{}
+	loadMu       sync.Mutex
+	loadNext     *loadFlight
+	loadRunning  bool
 	peerBase     func(host string) string
 }
 
 func NewServer(cfg *Config, transfer *ecdh.PrivateKey, a wire.Attester, v Verifier, client *http.Client) *Server {
 	instance := make([]byte, 16)
+	nonceKey := make([]byte, 32)
 	if _, err := rand.Read(instance); err != nil {
 		panic(err)
 	}
+	if _, err := rand.Read(nonceKey); err != nil {
+		panic(err)
+	}
 	return &Server{
-		cfg:          cfg,
-		transfer:     transfer,
-		attester:     a,
-		verifier:     v,
-		client:       client,
-		booted:       time.Now(),
-		nonces:       make(map[string]issuedNonce),
+		cfg:      cfg,
+		transfer: transfer,
+		attester: a,
+		verifier: v,
+		client:   client,
+		booted:   time.Now(),
+		nonceKey: nonceKey,
+		spent: map[spentClass]*spentSet{
+			spentPull:   newSpentSet(maxSpentPulls, true),
+			spentBoot:   newSpentSet(maxSpentStrict, false),
+			spentShare:  newSpentSet(maxSpentStrict, false),
+			spentImport: newSpentSet(maxSpentStrict, false),
+		},
 		instance:     hex.EncodeToString(instance),
 		counterCalls: make(chan struct{}, maxCounterCalls),
 		peerBase:     func(host string) string { return "https://" + host },
@@ -481,46 +514,92 @@ func (s *Server) handleBundle(w http.ResponseWriter, _ *http.Request) {
 	writeJSON(w, http.StatusOK, s.bundle)
 }
 
-// issueNonce makes a one-use nonce for one kind of exchange.
+// issueNonce makes a nonce for one kind of exchange. It keeps nothing: the
+// nonce carries its use and expiry under a MAC with this process's key, so
+// nobody can run the vault out of nonces (security review H1). Single use is
+// spend's, once the exchange has shown what it is.
+//
+// Layout: use (1) | expiry, Unix ms (8) | random (7) | MAC (16).
 func (s *Server) issueNonce(use nonceUse) (string, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	now := time.Now()
-	for n, issued := range s.nonces {
-		if now.After(issued.expires) {
-			delete(s.nonces, n)
-		}
-	}
-	if len(s.nonces) >= maxNonces {
-		return "", errTooMany
-	}
-	nonce, err := wire.RandomNonce()
-	if err != nil {
+	nonce := make([]byte, wire.NonceSize)
+	nonce[0] = nonceUseByte[use]
+	binary.BigEndian.PutUint64(nonce[1:9], uint64(time.Now().Add(nonceLifetime).UnixMilli()))
+	if _, err := rand.Read(nonce[9:16]); err != nil {
 		return "", err
 	}
-	encoded := hex.EncodeToString(nonce)
-	s.nonces[encoded] = issuedNonce{use: use, expires: now.Add(nonceLifetime)}
-	return encoded, nil
+	copy(nonce[16:], s.nonceMAC(nonce[:16]))
+	return hex.EncodeToString(nonce), nil
+}
+
+func (s *Server) nonceMAC(body []byte) []byte {
+	m := hmac.New(sha256.New, s.nonceKey)
+	m.Write([]byte("fount-mail-vault/nonce/v1\x00"))
+	m.Write(body)
+	return m.Sum(nil)[:16]
+}
+
+// checkNonce is whether this process issued the nonce, for use, and it hasn't
+// expired. It doesn't spend it.
+func (s *Server) checkNonce(encoded string, use nonceUse) (time.Time, error) {
+	nonce, err := hex.DecodeString(encoded)
+	if err != nil || len(nonce) != wire.NonceSize || !hmac.Equal(s.nonceMAC(nonce[:16]), nonce[16:]) {
+		return time.Time{}, errors.New("unknown nonce: this vault didn't issue it, or it restarted since")
+	}
+	if nonce[0] != nonceUseByte[use] {
+		for other, b := range nonceUseByte {
+			if b == nonce[0] {
+				return time.Time{}, fmt.Errorf("nonce was issued for %s, not %s", other, use)
+			}
+		}
+	}
+	expires := time.UnixMilli(int64(binary.BigEndian.Uint64(nonce[1:9])))
+	if time.Now().After(expires) {
+		return time.Time{}, errors.New("expired nonce")
+	}
+	return expires, nil
+}
+
+// spend makes a checked nonce single-use within its class. It comes after
+// whatever proves the exchange, so a request that proves nothing spends
+// nothing, and a flood of pulls can't fill the sets boots and the operator
+// use.
+func (s *Server) spend(encoded string, expires time.Time, class spentClass) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.spent[class].add(encoded, expires, time.Now())
 }
 
 var errTooMany = errors.New("too many open exchanges")
 
-// consumeNonce makes each challenge single-use, so a document or a signed request
-// for it can't be replayed, even by someone who saw the first exchange.
-func (s *Server) consumeNonce(encoded string, use nonceUse) error {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	issued, ok := s.nonces[encoded]
-	if !ok {
-		return errors.New("unknown or already used nonce")
+// spentSet is the nonces of one class spent and not yet expired, oldest first.
+type spentSet struct {
+	max   int
+	evict bool
+	at    map[string]time.Time
+	order []string
+}
+
+func newSpentSet(max int, evict bool) *spentSet {
+	return &spentSet{max: max, evict: evict, at: map[string]time.Time{}}
+}
+
+func (p *spentSet) add(nonce string, expires, now time.Time) error {
+	if _, ok := p.at[nonce]; ok {
+		return errors.New("already used nonce")
 	}
-	delete(s.nonces, encoded)
-	if issued.use != use {
-		return fmt.Errorf("nonce was issued for %s, not %s", issued.use, use)
+	for len(p.order) > 0 {
+		oldest := p.order[0]
+		if exp, ok := p.at[oldest]; ok && now.Before(exp) && len(p.at) < p.max {
+			break
+		}
+		if exp, ok := p.at[oldest]; ok && now.Before(exp) && !p.evict {
+			return errTooMany
+		}
+		delete(p.at, oldest)
+		p.order = p.order[1:]
 	}
-	if time.Now().After(issued.expires) {
-		return errors.New("expired nonce")
-	}
+	p.at[nonce] = expires
+	p.order = append(p.order, nonce)
 	return nil
 }
 
