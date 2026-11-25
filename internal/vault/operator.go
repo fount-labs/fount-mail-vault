@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"slices"
 	"time"
 
 	"github.com/fount-labs/fount-mail-vault/internal/recovery"
@@ -140,17 +141,21 @@ func (s *Server) handleShare(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusForbidden, errors.New("refused at sender: a share must be sealed from a RECOVERY_RECIPIENTS identity"))
 		return
 	}
-	// The recipient keys are public, so only a box that opens, which only the
-	// identity could have sealed, counts against the recipient's budget.
-	if !s.shareTurn(slot, time.Now(), false) {
+	// The place is taken before the box is opened, under the lock, so
+	// parallel submissions can't all pass the check before any is counted
+	// (round-3 re-check R3-8). The recipient keys are public, so only a box
+	// that opens, which only the identity could have sealed, keeps it: one
+	// that doesn't gives it back.
+	giveBack, ok := s.takeShareTurn(slot, time.Now())
+	if !ok {
 		writeError(w, http.StatusTooManyRequests, fmt.Errorf("recipient %d has sent %d shares in %s; wait", slot, maxSharesPerRecipient, nonceLifetime))
 		return
 	}
 	share, ok := s.openSealed(w, req, wire.PurposeShare)
 	if !ok {
+		giveBack()
 		return
 	}
-	s.shareTurn(slot, time.Now(), true)
 	if len(share) < 2 || int(share[0]) != slot {
 		label := share0(share)
 		clear(share)
@@ -195,10 +200,11 @@ func (s *Server) recipientSlot(sender []byte) int {
 	return 0
 }
 
-// shareTurn reports whether the recipient is within its budget, and with take
-// counts a submission against it. The budget keeps one recipient, even with a
-// stolen identity, from filling spentShare for the rest.
-func (s *Server) shareTurn(slot int, now time.Time, take bool) bool {
+// takeShareTurn takes a place in the recipient's budget, if it has one,
+// atomically with the check; giveBack returns it. The budget keeps one
+// recipient, even with a stolen identity, from filling spentShare for the
+// rest.
+func (s *Server) takeShareTurn(slot int, now time.Time) (giveBack func(), ok bool) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if s.shareTimes == nil {
@@ -210,11 +216,19 @@ func (s *Server) shareTurn(slot int, now time.Time, take bool) bool {
 			recent = append(recent, t)
 		}
 	}
-	if take {
-		recent = append(recent, now)
-	}
 	s.shareTimes[slot] = recent
-	return take || len(recent) < maxSharesPerRecipient
+	if len(recent) >= maxSharesPerRecipient {
+		return nil, false
+	}
+	s.shareTimes[slot] = append(recent, now)
+	return func() {
+		s.mu.Lock()
+		defer s.mu.Unlock()
+		times := s.shareTimes[slot]
+		if i := slices.Index(times, now); i >= 0 {
+			s.shareTimes[slot] = slices.Delete(times, i, i+1)
+		}
+	}, true
 }
 
 func share0(share []byte) int {

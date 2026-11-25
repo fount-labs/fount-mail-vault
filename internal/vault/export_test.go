@@ -54,3 +54,6 @@ func (s *Server) ShrinkSpent(n int) {
 		p.max = n
 	}
 }
+
+// MaxSharesPerRecipient is maxSharesPerRecipient.
+const MaxSharesPerRecipient = maxSharesPerRecipient

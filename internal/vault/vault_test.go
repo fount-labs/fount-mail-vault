@@ -13,6 +13,8 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
 
 	"filippo.io/age"
@@ -463,6 +465,41 @@ func TestOneRecipientCantFloodShares(t *testing.T) {
 	}
 	if restored, err := c.SubmitShare(context.Background(), second.Share, second.Key); err != nil || !restored {
 		t.Fatalf("another recipient after the flood: restored=%v, %v", restored, err)
+	}
+}
+
+// Round-3 re-check R3-8: the budget was checked before a share opened and
+// counted after, so 64 parallel submissions from one recipient got 13
+// accepted against 8.
+func TestParallelSharesKeepToTheBudget(t *testing.T) {
+	f := newFixture(t, 3, 2)
+	commitment, v := f.bootstrap()
+	bundle, err := f.operatorClient(v, "vault-a").Bundle(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	fresh := f.vault("vault-fresh", "v0.1.1", commitment)
+	c := f.operatorClient(fresh, "vault-fresh")
+	first := f.decrypt(t, bundle, 0)
+	// A box that doesn't open gives its place back.
+	for range 3 * vault.MaxSharesPerRecipient {
+		forged := sealedShare(t, f, fresh, "vault-fresh", f.ids[0].Recipient().String())
+		if err := wire.PostJSON(context.Background(), http.DefaultClient, fresh.url+"/recovery/share", forged, &map[string]any{}); err == nil || !strings.Contains(err.Error(), "refused at open") {
+			t.Fatalf("forged share: %v", err)
+		}
+	}
+	var accepted atomic.Int32
+	var wg sync.WaitGroup
+	for range 64 {
+		wg.Go(func() {
+			if _, err := c.SubmitShare(context.Background(), first.Share, first.Key); err == nil {
+				accepted.Add(1)
+			}
+		})
+	}
+	wg.Wait()
+	if got := accepted.Load(); got != vault.MaxSharesPerRecipient {
+		t.Fatalf("%d parallel shares accepted, the budget is %d", got, vault.MaxSharesPerRecipient)
 	}
 }
 
