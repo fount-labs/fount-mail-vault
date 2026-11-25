@@ -413,9 +413,10 @@ proof.
    boot proof, `COORDINATOR_HOSTS`, and `EDGE_MIN_TAG` at that coordinator
    release, so older coordinators, which can't prove, and old restore
    releases are refused at the minimum tag.
-3. Only then a coordinator release that uses counter version 2 (a vault
-   before step 2 can't answer it, and a vault mid-upgrade would hash the
-   digest differently).
+3. Only then turn on counter version 2 at the coordinator,
+   `--counter-states` (`FOUNT_COORDINATOR_COUNTER_STATES=1`), built in
+   fount-broker `fix/vault-boot` (a vault before step 2 can't answer it,
+   and a vault mid-upgrade would hash the digest differently).
 
 ## Broker side
 
@@ -423,6 +424,12 @@ proof.
   certificate, the generation key and the S3 credentials.
 - `vaultcounter` implements `coordinator.VaultCounter` with
   `wire.CounterClient`.
+- The generation waits for the volume (fount-broker `fix/vault-boot`):
+  the keyset pull boots nothing, and once the volume is open the
+  coordinator boots only when its security sequence has reached the count,
+  the count is 0, or `--restore` targets an empty volume. Otherwise it
+  reports `refused` on `/status` and fences nobody. A retired coordinator
+  fails `/health`. Every restore moves the count one past the root's.
 - `--wrapping-key vault` takes `--backup-bucket` once
   `--coordinator-authority-key` is set. It uses the bucket credentials from
   the vault (`vaultctl import-s3`), not the environment.
