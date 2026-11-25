@@ -51,6 +51,7 @@ missing or malformed.
 | `COORDINATOR_MODE` | `1` only on the Cloud vault pair, whose `EDGE_REPO` is the coordinator's config repo. Needs exactly two `VAULT_PEERS`. See `docs/COORDINATOR-COUNTER.md` |
 | `GENERATION_AUTHORITY_KEY` | Cloud only. Empty only in the release that generates the generation keyset. It's the same string as the edge's `COORDINATOR_AUTHORITY_KEY` |
 | `GENERATION_FLOOR`, `COUNT_FLOOR` | Cloud only, required. Where the register starts when the generation keyset is generated, and the lowest register a release takes from a peer |
+| `COORDINATOR_HOSTS` | Cloud only, required with `GENERATION_AUTHORITY_KEY`. The prod coordinator's hostnames: a boot is only for the enclave whose attested TLS key one of them serves (docs/COORDINATOR-COUNTER.md, "Booting a generation") |
 
 ## Bootstrap
 
