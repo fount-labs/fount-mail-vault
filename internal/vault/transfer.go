@@ -91,6 +91,10 @@ func (s *Server) handleFinish(w http.ResponseWriter, r *http.Request) {
 			s.refuse(w, "boot proof", err)
 			return
 		}
+		if err := s.checkCoordinatorHost(r.Context(), peer); err != nil {
+			s.refuse(w, "coordinator host", err)
+			return
+		}
 		class = spentBoot
 	}
 	if err := s.spend(req.Nonce, expires, class); err != nil {
@@ -118,12 +122,21 @@ func (s *Server) handleFinish(w http.ResponseWriter, r *http.Request) {
 		p.GenerationKeyset, p.Register = gen.MarshalBinary(), history
 	}
 	if coordinatorKey != nil {
+		if err := s.takeBoot(); err != nil {
+			log.Printf("boot for %s %s (%s): %v", peer.Repo, peer.Tag, peer.KeyFingerprint, err)
+			writeError(w, http.StatusTooManyRequests, fmt.Errorf("refused at boot rate: %w", err))
+			return
+		}
 		cert, n, err := s.boot(r.Context(), coordinatorKey)
 		if err != nil {
+			if errors.Is(err, errNothingMoved) {
+				s.refundBoot()
+			}
 			log.Printf("boot for %s %s: %v", peer.Repo, peer.Tag, err)
 			writeError(w, http.StatusServiceUnavailable, fmt.Errorf("booting a generation: %w", err))
 			return
 		}
+		s.recordBoot(peer, n)
 		p.GenerationCertificate = cert
 		log.Printf("coordinator %s %s (%s) booted generation %d", peer.Repo, peer.Tag, peer.KeyFingerprint, n)
 	}

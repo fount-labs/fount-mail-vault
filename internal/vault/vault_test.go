@@ -40,6 +40,7 @@ type release struct {
 	key     *ecdh.PublicKey
 	sendKey *ecdh.PublicKey // endorsed as send-transfer; nil for most releases
 	tag     string
+	tlsFP   string // the TLS key it attests; empty for most releases
 }
 
 type fakeAttester struct{ name string }
@@ -61,7 +62,7 @@ func (w *world) Verify(doc, nonce []byte, pin string) (*attest.Peer, error) {
 	if chip == "" {
 		chip = "machine-1"
 	}
-	return &attest.Peer{Key: r.key, SendKey: r.sendKey, KeyFingerprint: wire.Fingerprint(r.key), Repo: pin, Tag: r.tag, ChipID: chip}, nil
+	return &attest.Peer{Key: r.key, SendKey: r.sendKey, KeyFingerprint: wire.Fingerprint(r.key), Repo: pin, Tag: r.tag, ChipID: chip, TLSKeyFP: r.tlsFP}, nil
 }
 
 func (w *world) enroll(pin, name, tag string) *ecdh.PrivateKey {

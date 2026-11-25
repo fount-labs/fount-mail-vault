@@ -498,7 +498,7 @@ func (s *Server) propose(ctx context.Context, next func(head regState) (*regStat
 	defer s.proposeMu.Unlock()
 	head, views, err := s.settle(ctx)
 	if err != nil {
-		return regState{}, err
+		return regState{}, fmt.Errorf("%w: %w", errNothingMoved, err)
 	}
 	n, err := next(head)
 	if err != nil || n == nil {
@@ -523,6 +523,9 @@ func (s *Server) propose(ctx context.Context, next func(head regState) (*regStat
 	s.adopt(chain)
 	return *n, nil
 }
+
+// errNothingMoved is a proposal refused before it was sent to either vault.
+var errNothingMoved = errors.New("nothing changed")
 
 // syncLoop keeps both vaults' registers level, and this vault's own copy
 // with them, so a vault promoted from a held candidate is current within

@@ -127,6 +127,9 @@ type Server struct {
 	loadNext     *loadFlight
 	loadRunning  bool
 	peerBase     func(host string) string
+	boots        bootStats
+	// servingKey is the TLS key a coordinator host serves; tests replace it.
+	servingKey func(ctx context.Context, host string) (string, error)
 }
 
 func NewServer(cfg *Config, transfer *ecdh.PrivateKey, a wire.Attester, v Verifier, client *http.Client) *Server {
@@ -138,7 +141,7 @@ func NewServer(cfg *Config, transfer *ecdh.PrivateKey, a wire.Attester, v Verifi
 	if _, err := rand.Read(nonceKey); err != nil {
 		panic(err)
 	}
-	return &Server{
+	s := &Server{
 		cfg:      cfg,
 		transfer: transfer,
 		attester: a,
@@ -156,6 +159,8 @@ func NewServer(cfg *Config, transfer *ecdh.PrivateKey, a wire.Attester, v Verifi
 		counterCalls: make(chan struct{}, maxCounterCalls),
 		peerBase:     func(host string) string { return "https://" + host },
 	}
+	s.servingKey = tlsKeyServing(client, func(host string) string { return s.peerBase(host) })
+	return s
 }
 
 func (s *Server) Routes() http.Handler {
@@ -403,6 +408,8 @@ func (s *Server) handleStatus(w http.ResponseWriter, _ *http.Request) {
 			"generation_source":    s.genSource,
 			"instance":             s.instance,
 			"last_sync":            s.lastSync,
+			"coordinator_hosts":    s.cfg.CoordinatorHosts,
+			"boots":                s.boots,
 		}
 		if s.genKeyset != nil {
 			cloud["authority_key"] = s.genKeyset.AuthorityKey()

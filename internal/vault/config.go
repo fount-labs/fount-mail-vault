@@ -44,6 +44,13 @@ type Config struct {
 	// release after a total loss can't forget them.
 	GenerationFloor uint64
 	CountFloor      uint64
+	// CoordinatorHosts is COORDINATOR_HOSTS: the hostnames Fount's own
+	// coordinator serves. A boot is only for an enclave whose attested TLS
+	// key is the one serving one of them, so a copy of the public release
+	// in someone else's Tinfoil account, which can't serve Fount's hostname,
+	// can't take a generation (vault review H2, broker review H3). Required
+	// with GENERATION_AUTHORITY_KEY, since that's the release that boots.
+	CoordinatorHosts []string
 }
 
 // LoadConfig fails on anything missing or malformed, because a vault that boots
@@ -124,8 +131,8 @@ func (c *Config) loadCoordinator(getenv func(string) string) error {
 	floor, count := getenv("GENERATION_FLOOR"), getenv("COUNT_FLOOR")
 	switch mode {
 	case "":
-		if c.GenerationKey != "" || floor != "" || count != "" {
-			return fmt.Errorf("GENERATION_AUTHORITY_KEY, GENERATION_FLOOR and COUNT_FLOOR need COORDINATOR_MODE=1")
+		if c.GenerationKey != "" || floor != "" || count != "" || getenv("COORDINATOR_HOSTS") != "" {
+			return fmt.Errorf("GENERATION_AUTHORITY_KEY, GENERATION_FLOOR, COUNT_FLOOR and COORDINATOR_HOSTS need COORDINATOR_MODE=1")
 		}
 		return nil
 	case "1":
@@ -135,6 +142,18 @@ func (c *Config) loadCoordinator(getenv func(string) string) error {
 		}
 	default:
 		return fmt.Errorf("COORDINATOR_MODE must be 1 or unset, got %q", mode)
+	}
+	for _, h := range strings.Split(getenv("COORDINATOR_HOSTS"), ",") {
+		if h = strings.TrimSpace(h); h == "" {
+			continue
+		}
+		if strings.ContainsAny(h, "/?#@: ") {
+			return fmt.Errorf("COORDINATOR_HOSTS entry %q must be a bare hostname", h)
+		}
+		c.CoordinatorHosts = append(c.CoordinatorHosts, h)
+	}
+	if c.GenerationKey != "" && len(c.CoordinatorHosts) == 0 {
+		return fmt.Errorf("GENERATION_AUTHORITY_KEY needs COORDINATOR_HOSTS: a boot is only for the coordinator serving one of them")
 	}
 	if c.GenerationKey != "" {
 		if _, err := wire.ParseAuthorityKey(c.GenerationKey); err != nil {

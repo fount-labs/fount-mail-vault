@@ -6,6 +6,7 @@ import (
 	"crypto/ecdh"
 	"crypto/ed25519"
 	"crypto/rand"
+	"crypto/sha256"
 	"crypto/tls"
 	"crypto/x509"
 	"encoding/hex"
@@ -35,6 +36,9 @@ type router struct {
 	mu     sync.Mutex
 	routes map[string]*httptest.Server
 	pool   *x509.CertPool
+	// tlsFP is the TLS key every httptest server serves, so the enclave a
+	// coordinator host routes to attests it.
+	tlsFP string
 }
 
 func newRouter(t *testing.T) *router {
@@ -42,7 +46,9 @@ func newRouter(t *testing.T) *router {
 	t.Cleanup(ts.Close)
 	pool := x509.NewCertPool()
 	pool.AddCert(ts.Certificate()) // every httptest TLS server has this one
-	return &router{routes: map[string]*httptest.Server{}, pool: pool}
+	spki, _ := x509.MarshalPKIXPublicKey(ts.Certificate().PublicKey)
+	sum := sha256.Sum256(spki)
+	return &router{routes: map[string]*httptest.Server{}, pool: pool, tlsFP: hex.EncodeToString(sum[:])}
 }
 
 func (r *router) set(host string, ts *httptest.Server) {
@@ -79,8 +85,9 @@ func (r *router) client() *http.Client {
 }
 
 const (
-	hostA = "vault-a.example"
-	hostB = "vault-b.example"
+	hostA     = "vault-a.example"
+	hostB     = "vault-b.example"
+	coordHost = "coordinator.example"
 )
 
 type cloud struct {
@@ -112,6 +119,7 @@ func (c *cloud) config(authority string, floor, count uint64) *vault.Config {
 		"GENERATION_AUTHORITY_KEY": authority,
 		"GENERATION_FLOOR":         fmt.Sprint(floor),
 		"COUNT_FLOOR":              fmt.Sprint(count),
+		"COORDINATOR_HOSTS":        coordHost,
 	}
 	cfg, err := vault.LoadConfig(func(k string) string { return env[k] })
 	if err != nil {
@@ -173,6 +181,10 @@ func newCloud(t *testing.T, floor, count uint64) *cloud {
 	t.Helper()
 	f := newFixture(t, 2, 1)
 	c := &cloud{t: t, f: f, r: newRouter(t), nodes: map[string]*cloudNode{}}
+	// Fount's coordinator hostname, served by its enclave's shim.
+	served := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) { io.WriteString(w, "ok") }))
+	t.Cleanup(served.Close)
+	c.r.set(coordHost, served)
 	c.commitment, _ = f.bootstrap()
 	gen, authority := c.generateGeneration("vault-a-gen", "v0.2.0", floor, count)
 	c.authority = authority
@@ -208,8 +220,24 @@ type coordinator struct {
 	got    *wire.PullResult
 }
 
+// enrollCoordinator is an instance of the coordinator release on Fount's
+// hostname: its document attests the TLS key that hostname serves.
 func (c *cloud) enrollCoordinator(name string) *coordinator {
-	return &coordinator{name: name, key: c.f.w.enroll(coordRepo, name, "v1.0.0")}
+	co := c.enrollCopy(name)
+	r := c.f.w.releases[coordRepo][name]
+	r.tlsFP = c.r.tlsFP
+	c.f.w.releases[coordRepo][name] = r
+	return co
+}
+
+// enrollCopy is the same release deployed anywhere else: genuine, holding
+// its keys, but serving another hostname with another TLS key.
+func (c *cloud) enrollCopy(name string) *coordinator {
+	key := c.f.w.enroll(coordRepo, name, "v1.0.0")
+	r := c.f.w.releases[coordRepo][name]
+	r.tlsFP = strings.Repeat("0f", 32)
+	c.f.w.releases[coordRepo][name] = r
+	return &coordinator{name: name, key: key}
 }
 
 // boot is a coordinator's keyset pull from host that boots a generation.
@@ -803,6 +831,98 @@ func TestCloudLoadFloodLeavesSwaps(t *testing.T) {
 	wg.Wait()
 }
 
+// Vault review H2, broker review H3: a genuine instance of the coordinator
+// release deployed in anyone's Tinfoil account took a generation, and with
+// it fenced the real coordinator, at every crash-looping boot.
+func TestCloudBootIsOnlyForTheCoordinatorHost(t *testing.T) {
+	c := newCloud(t, 0, 0)
+	prod := c.mustBoot("coordinator-prod", hostA)
+	elsewhere := c.enrollCopy("coordinator-elsewhere")
+	if err := c.boot(elsewhere, hostA); err == nil || !strings.Contains(err.Error(), "refused at coordinator host") {
+		t.Fatalf("a copy in another account booting: %v", err)
+	}
+	// One whose document attests no TLS key at all.
+	none := c.enrollCopy("coordinator-no-tls")
+	r := c.f.w.releases[coordRepo][none.name]
+	r.tlsFP = ""
+	c.f.w.releases[coordRepo][none.name] = r
+	if err := c.boot(none, hostA); err == nil || !strings.Contains(err.Error(), "endorses no TLS key") {
+		t.Fatalf("a boot attesting no TLS key: %v", err)
+	}
+	// The hostname down: nobody boots, and the register stays.
+	served := c.r.routes[coordHost]
+	c.r.down(coordHost)
+	if err := c.boot(c.enrollCoordinator("coordinator-next"), hostA); err == nil || !strings.Contains(err.Error(), "refused at coordinator host") {
+		t.Fatalf("a boot with the hostname unreachable: %v", err)
+	}
+	c.r.set(coordHost, served)
+	c.level(wire.CounterState{Generation: 1, Count: 0})
+	if err := c.cas(prod, hostB, 1, 0, 1); err != nil {
+		t.Fatalf("prod after the copies' boots: %v", err)
+	}
+	if b := c.boots(hostA); b.WrongHost != 2 || b.Count != 1 || b.LastGen != 1 || b.LastTLSFP != c.r.tlsFP {
+		t.Fatalf("/status boots: %+v", b)
+	}
+}
+
+// A coordinator that keeps booting is held back, and /status counts it.
+func TestCloudBootsAreRateLimited(t *testing.T) {
+	c := newCloud(t, 0, 0)
+	for i := range 4 {
+		c.mustBoot(fmt.Sprintf("coordinator-%d", i), hostA)
+	}
+	err := c.boot(c.enrollCoordinator("coordinator-5"), hostA)
+	if err == nil || !strings.Contains(err.Error(), "refused at boot rate") {
+		t.Fatalf("a fifth boot at once: %v", err)
+	}
+	if b := c.boots(hostA); b.RateLimited != 1 || b.Count != 4 {
+		t.Fatalf("/status boots: %+v", b)
+	}
+	c.level(wire.CounterState{Generation: 4, Count: 0})
+	// The other vault has its own allowance.
+	if co := c.mustBoot("coordinator-6", hostB); co.number != 5 {
+		t.Fatalf("a boot at vault-b is generation %d", co.number)
+	}
+	// A boot refused because a vault was down moved nothing and spends
+	// nothing.
+	b := c.nodes["vault-b"]
+	c.r.down(hostB)
+	for range 6 {
+		c.boot(c.enrollCoordinator("coordinator-down"), hostA)
+	}
+	c.r.set(hostB, b.ts)
+	if err := c.boot(c.enrollCoordinator("coordinator-7"), hostB); err != nil {
+		t.Fatalf("a boot at vault-b after vault-b's outage: %v", err)
+	}
+}
+
+type bootsStatus struct {
+	Count       int    `json:"count"`
+	RateLimited int    `json:"rate_limited"`
+	WrongHost   int    `json:"wrong_host"`
+	LastGen     uint64 `json:"last_generation"`
+	LastTLSFP   string `json:"last_tls_key_fp"`
+}
+
+// boots is /status's coordinator.boots at host.
+func (c *cloud) boots(host string) bootsStatus {
+	c.t.Helper()
+	resp, err := c.r.client().Get("https://" + host + "/status")
+	if err != nil {
+		c.t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	var st struct {
+		Coordinator struct {
+			Boots bootsStatus `json:"boots"`
+		} `json:"coordinator"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&st); err != nil {
+		c.t.Fatal(err)
+	}
+	return st.Coordinator.Boots
+}
+
 func TestCloudConcurrentSwapsDontFork(t *testing.T) {
 	c := newCloud(t, 0, 0)
 	gen1 := c.mustBoot("coordinator-1", hostA)
@@ -868,6 +988,7 @@ func TestCloudConfig(t *testing.T) {
 		"RECOVERY_RECIPIENTS": f.ids[0].Recipient().String(), "RECOVERY_THRESHOLD": "1",
 		"OPERATOR_KEY":     hex.EncodeToString(f.operator.Public().(ed25519.PublicKey)),
 		"COORDINATOR_MODE": "1", "GENERATION_FLOOR": "0", "COUNT_FLOOR": "0",
+		"COORDINATOR_HOSTS": coordHost,
 	}
 	pub, _, _ := ed25519.GenerateKey(nil)
 	g := &wire.GenerationKeyset{}
@@ -879,7 +1000,9 @@ func TestCloudConfig(t *testing.T) {
 		"bad mode":               {"COORDINATOR_MODE": "yes"},
 		"bad authority":          {"GENERATION_AUTHORITY_KEY": "abc"},
 		"authority, no keyset":   {"GENERATION_AUTHORITY_KEY": g.AuthorityKey(), "KEYSET_COMMITMENT": ""},
-		"floors on a mail vault": {"COORDINATOR_MODE": ""},
+		"floors on a mail vault": {"COORDINATOR_MODE": "", "GENERATION_FLOOR": "", "COUNT_FLOOR": ""},
+		"authority, no hosts":    {"GENERATION_AUTHORITY_KEY": g.AuthorityKey(), "COORDINATOR_HOSTS": ""},
+		"bad host":               {"GENERATION_AUTHORITY_KEY": g.AuthorityKey(), "COORDINATOR_HOSTS": "https://" + coordHost},
 	} {
 		env := map[string]string{}
 		for k, v := range base {
