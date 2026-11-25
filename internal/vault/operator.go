@@ -1,6 +1,7 @@
 package vault
 
 import (
+	"bytes"
 	"crypto/ed25519"
 	"crypto/subtle"
 	"encoding/json"
@@ -168,12 +169,24 @@ func (s *Server) handleShare(w http.ResponseWriter, r *http.Request) {
 	}
 	clear(s.pending[slot])
 	s.pending[slot] = share
+	// The attempt reads copies: a concurrent submission that replaces a
+	// slot, or one that restores, clears the pending bytes, which would
+	// make this attempt read zeros and answer a false "not restored"
+	// (round-3 re-check R3-9).
 	pending := make([][]byte, 0, len(s.pending))
 	for _, p := range s.pending {
-		pending = append(pending, p)
+		pending = append(pending, bytes.Clone(p))
 	}
 	s.mu.Unlock()
+	defer func() {
+		for _, p := range pending {
+			clear(p)
+		}
+	}()
 
+	if s.beforeCombine != nil {
+		s.beforeCombine()
+	}
 	k, err := recovery.Combine(pending, s.cfg.Threshold, s.cfg.Commitment)
 	if err != nil {
 		writeJSON(w, http.StatusOK, map[string]any{"accepted": true, "restored": false, "pending_shares": len(pending)})

@@ -117,6 +117,9 @@ type Server struct {
 	// shareTimes when each recipient last submitted (maxSharesPerRecipient).
 	pending    map[int][]byte
 	shareTimes map[int][]time.Time
+	// beforeCombine, set by tests only, runs as a restore attempt begins,
+	// outside the lock.
+	beforeCombine func()
 
 	// The Cloud vault's generation keyset and register (counter.go,
 	// register.go). instance is drawn per process.

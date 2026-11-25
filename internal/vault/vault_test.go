@@ -503,6 +503,36 @@ func TestParallelSharesKeepToTheBudget(t *testing.T) {
 	}
 }
 
+// Round-3 re-check R3-9: a restore attempt read the pending shares by
+// reference outside the lock, so a share that came meanwhile, replacing a
+// slot and restoring, cleared what the attempt was reading, and the
+// attempt answered a false "not restored".
+func TestARestoreAttemptReadsItsOwnCopyOfTheShares(t *testing.T) {
+	f := newFixture(t, 2, 2)
+	commitment, v := f.bootstrap()
+	bundle, err := f.operatorClient(v, "vault-a").Bundle(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	fresh := f.vault("vault-fresh", "v0.1.1", commitment)
+	c := f.operatorClient(fresh, "vault-fresh")
+	first, second := f.decrypt(t, bundle, 0), f.decrypt(t, bundle, 1)
+	if _, err := c.SubmitShare(context.Background(), first.Share, first.Key); err != nil {
+		t.Fatal(err)
+	}
+	var overtaken atomic.Bool
+	fresh.s.BeforeCombine(func() {
+		if overtaken.CompareAndSwap(false, true) {
+			if restored, err := c.SubmitShare(context.Background(), first.Share, first.Key); err != nil || !restored {
+				t.Errorf("the share that came meanwhile: restored=%v, %v", restored, err)
+			}
+		}
+	})
+	if restored, err := c.SubmitShare(context.Background(), second.Share, second.Key); err != nil || !restored {
+		t.Fatalf("the attempt overtaken: restored=%v, %v", restored, err)
+	}
+}
+
 // sealedShare seals a junk share to the vault while claiming senderRecipient's
 // key, which the sender doesn't hold.
 func sealedShare(t *testing.T, f *fixture, n *node, name, senderRecipient string) vault.SealedRequest {

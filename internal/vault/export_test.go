@@ -57,3 +57,6 @@ func (s *Server) ShrinkSpent(n int) {
 
 // MaxSharesPerRecipient is maxSharesPerRecipient.
 const MaxSharesPerRecipient = maxSharesPerRecipient
+
+// BeforeCombine sets a hook that runs as each restore attempt begins.
+func (s *Server) BeforeCombine(f func()) { s.beforeCombine = f }
