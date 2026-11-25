@@ -5,6 +5,7 @@ import (
 	"context"
 	"crypto/ecdh"
 	"crypto/ed25519"
+	"crypto/rand"
 	"crypto/tls"
 	"crypto/x509"
 	"encoding/hex"
@@ -617,6 +618,68 @@ func TestCloudBootIsBoundToTheAttestation(t *testing.T) {
 	}
 	if st := c.load(hostA); st.Generation != 0 {
 		t.Fatalf("a refused boot moved the generation to %d", st.Generation)
+	}
+}
+
+// The review's C1 probe: an outsider with a genuine coordinator's document
+// for BootNonce(N, their key), fetched from its public attestation endpoint,
+// but not its transfer key. Before the boot proof this booted a generation
+// for the outsider's key, who then swapped the count to 2^64-1.
+func TestCloudBootNeedsTheTransferKey(t *testing.T) {
+	c := newCloud(t, 0, 0)
+	prod := c.mustBoot("coordinator-prod", hostA)
+	if err := c.cas(prod, hostA, 1, 0, 1); err != nil {
+		t.Fatal(err)
+	}
+	attackerPub, attackerPriv, _ := ed25519.GenerateKey(nil)
+	attackerTransfer, _ := ecdh.X25519().GenerateKey(rand.Reader)
+	public := fakeAttester{prod.name} // the prod coordinator's public endpoint
+	for name, prove := range map[string]func(begun wire.BeginResponse, n wire.Nonces) []byte{
+		"no proof": func(wire.BeginResponse, wire.Nonces) []byte { return nil },
+		"junk proof": func(wire.BeginResponse, wire.Nonces) []byte {
+			return bytes.Repeat([]byte{7}, 32)
+		},
+		// The best an outsider can do: an agreement with its own key, which
+		// isn't the one the document endorses.
+		"proof under the outsider's own key": func(begun wire.BeginResponse, n wire.Nonces) []byte {
+			holder, _ := wire.ParseRawKey(begun.HolderKey)
+			proof, _ := wire.BootProof(attackerTransfer, holder, attackerTransfer.PublicKey(), holder, n, attackerPub)
+			return proof
+		},
+		// The coordinator's public key in place of its private one.
+		"proof naming the coordinator's key": func(begun wire.BeginResponse, n wire.Nonces) []byte {
+			holder, _ := wire.ParseRawKey(begun.HolderKey)
+			proof, _ := wire.BootProof(attackerTransfer, holder, prod.key.PublicKey(), holder, n, attackerPub)
+			return proof
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			var begun wire.BeginResponse
+			if err := wire.PostJSON(context.Background(), c.r.client(), "https://"+hostA+"/transfer/begin", nil, &begun); err != nil {
+				t.Fatal(err)
+			}
+			issued, _ := wire.DecodeNonce(begun.Nonce)
+			answer, _ := wire.RandomNonce()
+			doc, _ := public.Attest(context.Background(), wire.BootNonce(issued, attackerPub))
+			status, out := c.post("https://"+hostA, "/transfer/finish", wire.FinishRequest{
+				Nonce: begun.Nonce, AnswerNonce: hex.EncodeToString(answer), Document: doc, CoordinatorKey: attackerPub,
+				BootProof: prove(begun, wire.Nonces{Issued: issued, Answer: answer})})
+			if status != http.StatusForbidden || !strings.Contains(string(out), "refused at boot proof") {
+				t.Fatalf("an outsider's boot answered %d: %s", status, out)
+			}
+			c.level(wire.CounterState{Generation: 1, Count: 1})
+			outsider := &coordinator{gen: attackerPriv}
+			if err := c.cas(outsider, hostA, 2, 1, 1<<63); !errors.Is(err, wire.ErrCounterGeneration) {
+				t.Fatalf("the outsider's swap: %v", err)
+			}
+		})
+	}
+	// The prod coordinator is still the live one, and its next boot works.
+	if err := c.cas(prod, hostB, 1, 1, 2); err != nil {
+		t.Fatalf("prod after the outsider's boots: %v", err)
+	}
+	if next := c.mustBoot("coordinator-prod", hostB); next.number != 2 {
+		t.Fatalf("prod's next boot is generation %d", next.number)
 	}
 }
 

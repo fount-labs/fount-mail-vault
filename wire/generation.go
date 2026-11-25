@@ -1,7 +1,10 @@
 package wire
 
 import (
+	"crypto/ecdh"
 	"crypto/ed25519"
+	"crypto/hkdf"
+	"crypto/hmac"
 	"crypto/rand"
 	"crypto/sha256"
 	"crypto/subtle"
@@ -172,4 +175,63 @@ func BootNonce(issued []byte, coordinatorKey ed25519.PublicKey) []byte {
 	h.Write(issued)
 	h.Write(coordinatorKey)
 	return h.Sum(nil)
+}
+
+// bootProofInfo separates the boot proof's key from the boxes' keys, which
+// come from the same X25519 agreement.
+const bootProofInfo = "fount-mail-vault/v1/boot-proof\x00"
+
+// BootProof shows that a boot's requester holds the private half of the
+// transfer key its document endorses. A document alone proves nothing about
+// the sender: the enclave's shim serves one for any nonce to anyone, so
+// without the proof anyone could attest a genuine coordinator to their own
+// per-boot key and take a generation (security review 2026-11-24, C1).
+//
+// It is an HMAC under a key from X25519(mine, peer), which only the two
+// attested transfer keys can compute, over everything the boot binds: both
+// transfer keys, both nonces and the per-boot key. The requester calls it
+// with its transfer key and the holder's, from BeginResponse.HolderKey; the
+// holder with its own and the requester's attested key. A holder key that
+// isn't the holder's makes a proof the holder refuses, so HolderKey needs no
+// authentication of its own.
+func BootProof(mine *ecdh.PrivateKey, peer, requester, holder *ecdh.PublicKey, n Nonces, coordinatorKey ed25519.PublicKey) ([]byte, error) {
+	if len(n.Issued) != NonceSize || len(n.Answer) != NonceSize {
+		return nil, fmt.Errorf("nonces must be %d bytes", NonceSize)
+	}
+	if len(coordinatorKey) != ed25519.PublicKeySize {
+		return nil, errors.New("a boot proof needs the coordinator's Ed25519 key")
+	}
+	shared, err := mine.ECDH(peer)
+	if err != nil {
+		return nil, fmt.Errorf("key agreement: %w", err)
+	}
+	key, err := hkdf.Key(sha256.New, shared, nil, bootProofInfo, 32)
+	clear(shared)
+	if err != nil {
+		return nil, err
+	}
+	m := hmac.New(sha256.New, key)
+	m.Write([]byte(bootLabel))
+	m.Write(requester.Bytes())
+	m.Write(holder.Bytes())
+	m.Write(n.Issued)
+	m.Write(n.Answer)
+	m.Write(coordinatorKey)
+	return m.Sum(nil), nil
+}
+
+// VerifyBootProof is the holder's side of BootProof: me is its transfer key,
+// requester the key the requester's document endorses.
+func VerifyBootProof(me *ecdh.PrivateKey, requester *ecdh.PublicKey, n Nonces, coordinatorKey ed25519.PublicKey, proof []byte) error {
+	if len(proof) == 0 {
+		return errors.New("a boot needs a boot proof: this coordinator release predates it")
+	}
+	want, err := BootProof(me, requester, requester, me.PublicKey(), n, coordinatorKey)
+	if err != nil {
+		return err
+	}
+	if !hmac.Equal(want, proof) {
+		return errors.New("the boot proof doesn't verify: the requester doesn't hold the transfer key its document endorses")
+	}
+	return nil
 }

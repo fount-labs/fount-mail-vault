@@ -21,9 +21,13 @@ const (
 	MaxBodyBytes      = 2*MaxDocumentBytes + 1<<20
 )
 
-// BeginResponse carries the holder's one-use nonce.
+// BeginResponse carries the holder's one-use nonce. HolderKey is the holder's
+// transfer key, which a booting coordinator needs for its BootProof; it's
+// unauthenticated here, and a wrong one only makes a proof the holder refuses.
+// A holder that predates boot proofs leaves it out.
 type BeginResponse struct {
-	Nonce string `json:"nonce"`
+	Nonce     string `json:"nonce"`
+	HolderKey []byte `json:"holder_key,omitempty"`
 }
 
 // FinishRequest is the requester's document for the holder's nonce, plus a nonce
@@ -31,12 +35,15 @@ type BeginResponse struct {
 //
 // CoordinatorKey, from a Cloud coordinator only, asks the vault to boot a
 // generation for that per-boot Ed25519 key. The document is then for
-// BootNonce(nonce, key) rather than the nonce, so it vouches for the key.
+// BootNonce(nonce, key) rather than the nonce, so it vouches for the key, and
+// BootProof shows the requester holds the transfer key the document endorses.
+// A Cloud vault boots nothing without it.
 type FinishRequest struct {
 	Nonce          string `json:"nonce"`
 	AnswerNonce    string `json:"answer_nonce"`
 	Document       []byte `json:"document"`
 	CoordinatorKey []byte `json:"coordinator_key,omitempty"`
+	BootProof      []byte `json:"boot_proof,omitempty"`
 }
 
 // FinishResponse carries the sealed payload. HolderKey is unauthenticated on its
@@ -154,7 +161,7 @@ func pull(ctx context.Context, client *http.Client, base string, me *ecdh.Privat
 	if commitment == "" && check == nil {
 		return nil, errors.New("pulling with no commitment needs a holder check")
 	}
-	ex, err := exchange(ctx, client, base, a, check, coordinatorKey)
+	ex, err := exchange(ctx, client, base, me, a, check, coordinatorKey)
 	if err != nil {
 		return nil, err
 	}
@@ -217,7 +224,7 @@ func PullSendKeyset(ctx context.Context, client *http.Client, base string, me *e
 	if sendCommitment == "" && check == nil {
 		return nil, errors.New("pulling the send keyset with no send commitment needs a holder check")
 	}
-	ex, err := exchange(ctx, client, base, a, check, nil)
+	ex, err := exchange(ctx, client, base, me, a, check, nil)
 	if err != nil {
 		return nil, err
 	}
@@ -250,8 +257,9 @@ type exchanged struct {
 
 // exchange runs begin and finish: the requester attests to the holder's nonce,
 // and, with a HolderCheck, checks the holder's document for its own. With a
-// coordinator key it attests to BootNonce instead, and sends the key.
-func exchange(ctx context.Context, client *http.Client, base string, a Attester, check HolderCheck, coordinatorKey ed25519.PublicKey) (*exchanged, error) {
+// coordinator key it attests to BootNonce instead, and sends the key with a
+// BootProof made with me.
+func exchange(ctx context.Context, client *http.Client, base string, me *ecdh.PrivateKey, a Attester, check HolderCheck, coordinatorKey ed25519.PublicKey) (*exchanged, error) {
 	start := time.Now()
 	var begun BeginResponse
 	if err := PostJSON(ctx, client, base+"/transfer/begin", nil, &begun); err != nil {
@@ -273,8 +281,19 @@ func exchange(ctx context.Context, client *http.Client, base string, a Attester,
 	if err != nil {
 		return nil, fmt.Errorf("attesting to holder: %w", err)
 	}
-	var finished FinishResponse
+	nonces := Nonces{Issued: issued, Answer: answer}
 	req := FinishRequest{Nonce: begun.Nonce, AnswerNonce: hex.EncodeToString(answer), Document: doc, CoordinatorKey: coordinatorKey}
+	// A holder that names no key predates boot proofs and boots without one.
+	if coordinatorKey != nil && len(begun.HolderKey) > 0 {
+		named, err := ParseRawKey(begun.HolderKey)
+		if err != nil {
+			return nil, fmt.Errorf("holder key at begin: %w", err)
+		}
+		if req.BootProof, err = BootProof(me, named, me.PublicKey(), named, nonces, coordinatorKey); err != nil {
+			return nil, err
+		}
+	}
+	var finished FinishResponse
 	if err := PostJSON(ctx, client, base+"/transfer/finish", req, &finished); err != nil {
 		return nil, fmt.Errorf("finish: %w", err)
 	}
@@ -291,7 +310,7 @@ func exchange(ctx context.Context, client *http.Client, base string, a Attester,
 			return nil, errors.New("verifying holder: its key isn't the one its document endorses")
 		}
 	}
-	return &exchanged{finished: finished, holder: holder, nonces: Nonces{Issued: issued, Answer: answer}, start: start}, nil
+	return &exchanged{finished: finished, holder: holder, nonces: nonces, start: start}, nil
 }
 
 // PostJSON posts in (or nothing) and decodes a 200 into out. Any other status is
