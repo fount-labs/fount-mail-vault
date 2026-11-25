@@ -958,6 +958,14 @@ func TestCloudConcurrentSwapsDontFork(t *testing.T) {
 	}
 }
 
+// Review L1: a Cloud vault made a send keyset for anyone who asked.
+func TestCloudVaultRefusesGenerateSend(t *testing.T) {
+	c := newCloud(t, 0, 0)
+	if status, out := c.post("https://"+hostA, "/generate-send", nil); status != http.StatusConflict {
+		t.Fatalf("generate-send at a Cloud vault answered %d: %s", status, out)
+	}
+}
+
 func TestMailVaultRefusesCloudCalls(t *testing.T) {
 	f := newFixture(t, 2, 1)
 	commitment, v := f.bootstrap()

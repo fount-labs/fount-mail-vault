@@ -56,7 +56,6 @@ shim:
     - /health
     - /status
     - /generate
-    - /generate-send
     - /transfer/begin
     - /transfer/finish
     - /recovery/bundle

@@ -467,6 +467,10 @@ func (s *Server) handleGenerate(w http.ResponseWriter, _ *http.Request) {
 // for the same reason as handleGenerate. The keyset commitment is what keeps it
 // apart from the first generate: the send keyset rides with the committed keyset.
 func (s *Server) handleGenerateSend(w http.ResponseWriter, _ *http.Request) {
+	if s.cfg.CoordinatorMode {
+		writeError(w, http.StatusConflict, errors.New("a Cloud vault holds no send keyset"))
+		return
+	}
 	if s.cfg.SendCommitment != "" {
 		writeError(w, http.StatusConflict, errNoSendSlot)
 		return
