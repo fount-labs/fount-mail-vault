@@ -46,6 +46,15 @@ const (
 	CounterNoGeneration = "no_generation"
 )
 
+// MaxCount and MaxCountStep bound a swap. The coordinator's security sequence
+// moves by one, so a swap that jumps further is a bug or an attacker; a count
+// at 2^64-1 would leave no successor, and one at 2^63 or more couldn't be
+// written back as COUNT_FLOOR after a total loss (security review M4).
+const (
+	MaxCount     = 1<<63 - 1
+	MaxCountStep = 1 << 20
+)
+
 // MaxCounterBody bounds a counter request or answer.
 const MaxCounterBody = 4 << 10
 
@@ -96,6 +105,9 @@ func (r *CounterRequest) Validate() ([]byte, error) {
 	case CounterCAS:
 		if r.Generation == 0 || len(r.Signature) != ed25519.SignatureSize {
 			return nil, errors.New("a cas names a generation and is signed")
+		}
+		if r.Next > MaxCount || (r.Next > r.Prev && r.Next-r.Prev > MaxCountStep) {
+			return nil, fmt.Errorf("a cas moves the count by at most %d, to at most %d", MaxCountStep, uint64(MaxCount))
 		}
 	default:
 		return nil, fmt.Errorf("unknown counter op %q", r.Op)
@@ -228,6 +240,9 @@ func (c *CounterClient) CompareAndSwap(ctx context.Context, key ed25519.PrivateK
 	}
 	r := &CounterRequest{Op: CounterCAS, Nonce: hex.EncodeToString(nonce), Generation: generation, Prev: prev, Next: next,
 		Signature: ed25519.Sign(key, CASMessage(nonce, generation, prev, next))}
+	if _, err := r.Validate(); err != nil {
+		return CounterState{}, err
+	}
 	st, err := c.call(ctx, r)
 	if err != nil {
 		return st, err

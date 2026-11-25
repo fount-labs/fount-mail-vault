@@ -669,7 +669,7 @@ func TestCloudBootNeedsTheTransferKey(t *testing.T) {
 			}
 			c.level(wire.CounterState{Generation: 1, Count: 1})
 			outsider := &coordinator{gen: attackerPriv}
-			if err := c.cas(outsider, hostA, 2, 1, 1<<63); !errors.Is(err, wire.ErrCounterGeneration) {
+			if err := c.cas(outsider, hostA, 2, 1, 2); !errors.Is(err, wire.ErrCounterGeneration) {
 				t.Fatalf("the outsider's swap: %v", err)
 			}
 		})
@@ -681,6 +681,32 @@ func TestCloudBootNeedsTheTransferKey(t *testing.T) {
 	if next := c.mustBoot("coordinator-prod", hostB); next.number != 2 {
 		t.Fatalf("prod's next boot is generation %d", next.number)
 	}
+}
+
+// Review M4: one swap to 2^64-1 left no successor, and a count at 2^63 or
+// more can't be written back as COUNT_FLOOR.
+func TestCloudSwapsAreBounded(t *testing.T) {
+	c := newCloud(t, 0, 0)
+	gen1 := c.mustBoot("coordinator-1", hostA)
+	raw := func(prev, next uint64) (int, string) {
+		nonce, _ := wire.RandomNonce()
+		status, out := c.post("https://"+hostA, wire.CounterPath, wire.CounterRequest{Op: wire.CounterCAS, Nonce: hex.EncodeToString(nonce),
+			Generation: 1, Prev: prev, Next: next, Signature: ed25519.Sign(gen1.gen, wire.CASMessage(nonce, 1, prev, next))})
+		return status, string(out)
+	}
+	for _, next := range []uint64{1<<64 - 1, 1 << 63, wire.MaxCountStep + 1} {
+		if status, out := raw(0, next); status != http.StatusBadRequest {
+			t.Fatalf("a swap from 0 to %d answered %d: %s", next, status, out)
+		}
+		if err := c.cas(gen1, hostA, 1, 0, next); err == nil {
+			t.Fatalf("the client sent a swap from 0 to %d", next)
+		}
+	}
+	c.level(wire.CounterState{Generation: 1, Count: 0})
+	if err := c.cas(gen1, hostA, 1, 0, wire.MaxCountStep); err != nil {
+		t.Fatal(err)
+	}
+	c.level(wire.CounterState{Generation: 1, Count: wire.MaxCountStep})
 }
 
 func TestCloudConcurrentSwapsDontFork(t *testing.T) {

@@ -17,6 +17,8 @@ import (
 	"net/http"
 	"sync"
 	"time"
+
+	"github.com/fount-labs/fount-mail-vault/wire"
 )
 
 // The coordinator's register (docs/COORDINATOR-COUNTER.md, "Replication"):
@@ -140,6 +142,9 @@ func step(a, b regState) error {
 	case b.Generation == a.Generation:
 		if len(a.Key) != 32 || !bytes.Equal(a.Key, b.Key) || b.Swap == nil || b.Swap.Prev != a.Count || b.Count <= a.Count {
 			return fmt.Errorf("state %d isn't a swap of state %d", b.Version, a.Version)
+		}
+		if b.Count > wire.MaxCount || b.Count-a.Count > wire.MaxCountStep {
+			return fmt.Errorf("state %d moves the count from %d to %d, past the bounds", b.Version, a.Count, b.Count)
 		}
 	default:
 		return fmt.Errorf("state %d moves the generation by more than one", b.Version)
