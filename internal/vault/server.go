@@ -26,10 +26,12 @@ const (
 	maxSpentPulls  = 1 << 14
 	maxSpentStrict = 1 << 12
 	maxRefusals    = 20
-	maxPending     = 32
-	selfCheckEvery = time.Hour
-	retryFirst     = 5 * time.Second
-	retryMax       = 2 * time.Minute
+	// maxSharesPerRecipient is how many shares one recipient may submit per
+	// nonce lifetime, so even a stolen identity can't fill spentShare.
+	maxSharesPerRecipient = 8
+	selfCheckEvery        = time.Hour
+	retryFirst            = 5 * time.Second
+	retryMax              = 2 * time.Minute
 )
 
 var (
@@ -111,7 +113,10 @@ type Server struct {
 	selfErr     string
 	selfChecked time.Time
 	bundle      *recovery.Bundle
-	pending     [][]byte
+	// pending holds at most one share per recipient, keyed by its index, and
+	// shareTimes when each recipient last submitted (maxSharesPerRecipient).
+	pending    map[int][]byte
+	shareTimes map[int][]time.Time
 
 	// The Cloud vault's generation keyset and register (counter.go,
 	// register.go). instance is drawn per process.

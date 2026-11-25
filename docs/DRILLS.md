@@ -176,8 +176,10 @@ Owner actions, in order:
 6. Straight away: `tinfoil container stop vault-drill`, then
    `tinfoil container delete vault-drill`. Then archive the drill repo.
 
-This drill doesn't cover "junk shares don't stop it". Only the unit tests do, since no tool
-makes a junk share that opens with a real identity.
+This drill doesn't cover "junk shares don't stop it". Only the unit tests do
+(`TestProbeJunkSharesBlockRestore`, `TestOneRecipientCantFloodShares`): a share sealed from
+anything but a recipient's identity is refused at `sender`, and one recipient can fill only
+its own slot.
 
 ## 4. Routing restore
 

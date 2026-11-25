@@ -3,6 +3,7 @@
 package vault
 
 import (
+	"crypto/ecdh"
 	"crypto/ed25519"
 	"encoding/hex"
 	"fmt"
@@ -27,8 +28,11 @@ type Config struct {
 	SendCommitment string
 	Peers          []string // VAULT_PEERS: vault hostnames to restore from, which may include this one
 	Recipients     []string // RECOVERY_RECIPIENTS: age X25519 recipients, one share each
-	Threshold      int      // RECOVERY_THRESHOLD: shares needed to restore
-	OperatorKey    ed25519.PublicKey
+	// RecipientKeys are the Recipients' X25519 keys, in the same order: share
+	// i+1 must be sealed from RecipientKeys[i].
+	RecipientKeys []*ecdh.PublicKey
+	Threshold     int // RECOVERY_THRESHOLD: shares needed to restore
+	OperatorKey   ed25519.PublicKey
 
 	// CoordinatorMode is COORDINATOR_MODE=1: this is the Cloud vault pair,
 	// its EDGE_REPO is the coordinator's config repo, and it keeps the
@@ -107,6 +111,13 @@ func LoadConfig(getenv func(string) string) (*Config, error) {
 		return nil, fmt.Errorf("RECOVERY_RECIPIENTS: %w", err)
 	}
 	c.Recipients = recipients
+	for _, r := range recipients {
+		key, err := recovery.RecipientKey(r)
+		if err != nil {
+			return nil, fmt.Errorf("RECOVERY_RECIPIENTS: %w", err)
+		}
+		c.RecipientKeys = append(c.RecipientKeys, key)
+	}
 	k, err := strconv.Atoi(getenv("RECOVERY_THRESHOLD"))
 	if err != nil || k < 1 || k > len(recipients) {
 		return nil, fmt.Errorf("RECOVERY_THRESHOLD must be 1 to %d, got %q", len(recipients), getenv("RECOVERY_THRESHOLD"))

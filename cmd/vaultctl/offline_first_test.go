@@ -32,6 +32,7 @@ type fakeVault struct {
 	t     *testing.T
 	key   *ecdh.PrivateKey
 	want  []byte
+	from  []byte
 	mu    sync.Mutex
 	paths []string
 	issue []byte
@@ -79,6 +80,9 @@ func (f *fakeVault) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		if err != nil {
 			http.Error(w, err.Error(), http.StatusBadRequest)
 			return
+		}
+		if !bytes.Equal(req.SenderKey, f.from) {
+			f.t.Errorf("share wasn't sealed from the identity that opened it")
 		}
 		if !bytes.Equal(got, f.want) {
 			f.t.Errorf("vault opened a share that isn't the bundle's")
@@ -130,7 +134,11 @@ func drillFixture(t *testing.T) (bundlePath, identityPath string, fv *fakeVault,
 	if err != nil {
 		t.Fatal(err)
 	}
-	fv = &fakeVault{t: t, key: key, want: shares[0], issue: issue}
+	from, err := recovery.RecipientKey(id.Recipient().String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	fv = &fakeVault{t: t, key: key, want: shares[0], from: from.Bytes(), issue: issue}
 	srv := httptest.NewServer(fv)
 	t.Cleanup(srv.Close)
 	c = &opclient.Client{HTTP: srv.Client(), Base: srv.URL, Verify: func(doc, nonce []byte) (*ecdh.PublicKey, error) {

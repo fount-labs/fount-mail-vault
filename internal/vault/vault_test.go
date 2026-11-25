@@ -19,6 +19,7 @@ import (
 
 	"github.com/fount-labs/fount-mail-vault/internal/attest"
 	"github.com/fount-labs/fount-mail-vault/internal/opclient"
+	"github.com/fount-labs/fount-mail-vault/internal/recovery"
 	"github.com/fount-labs/fount-mail-vault/internal/vault"
 	"github.com/fount-labs/fount-mail-vault/wire"
 )
@@ -383,19 +384,109 @@ func TestRestoreFromShares(t *testing.T) {
 	fresh := f.vault("vault-fresh", "v0.1.1", commitment)
 	c := f.operatorClient(fresh, "vault-fresh")
 	first := f.decrypt(t, bundle, 0)
-	if restored, err := c.SubmitShare(context.Background(), first); err != nil || restored {
+	if restored, err := c.SubmitShare(context.Background(), first.Share, first.Key); err != nil || restored {
 		t.Fatalf("one share of two: restored=%v, %v", restored, err)
 	}
-	junk := append([]byte{3}, bytes.Repeat([]byte{0xaa}, len(first)-1)...)
-	if restored, err := c.SubmitShare(context.Background(), junk); err != nil || restored {
+	// A shareholder's wrong share takes only its own slot, and their right one
+	// replaces it.
+	third := f.decrypt(t, bundle, 2)
+	junk := append([]byte{3}, bytes.Repeat([]byte{0xaa}, len(first.Share)-1)...)
+	if restored, err := c.SubmitShare(context.Background(), junk, third.Key); err != nil || restored {
 		t.Fatalf("junk share: restored=%v, %v", restored, err)
 	}
-	if restored, err := c.SubmitShare(context.Background(), f.decrypt(t, bundle, 2)); err != nil || !restored {
+	if restored, err := c.SubmitShare(context.Background(), third.Share, third.Key); err != nil || !restored {
 		t.Fatalf("second real share: restored=%v, %v", restored, err)
 	}
 	if got := fresh.status(t)["keyset_commitment"]; got != commitment {
 		t.Fatalf("restored %v, want %s", got, commitment)
 	}
+}
+
+// Vault re-review N3: anyone can seal to the transfer key, so before shares
+// were tied to recipients 32 junk shares filled every slot and refused the real
+// ones until a redeploy.
+func TestProbeJunkSharesBlockRestore(t *testing.T) {
+	f := newFixture(t, 3, 2)
+	commitment, v := f.bootstrap()
+	bundle, err := f.operatorClient(v, "vault-a").Bundle(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	fresh := f.vault("vault-fresh", "v0.1.1", commitment)
+	c := f.operatorClient(fresh, "vault-fresh")
+	first, second := f.decrypt(t, bundle, 0), f.decrypt(t, bundle, 1)
+	for i := range 64 {
+		stranger, _ := ecdh.X25519().GenerateKey(rand.Reader)
+		junk := append([]byte{byte(i%3 + 1)}, bytes.Repeat([]byte{byte(i)}, len(first.Share)-1)...)
+		if _, err := c.SubmitShare(context.Background(), junk, stranger); err == nil || !strings.Contains(err.Error(), "refused at sender") {
+			t.Fatalf("junk share %d from a stranger: %v", i, err)
+		}
+	}
+	// A recipient's key is public; claiming it without the identity opens nothing.
+	forged := sealedShare(t, f, fresh, "vault-fresh", f.ids[0].Recipient().String())
+	if err := wire.PostJSON(context.Background(), http.DefaultClient, fresh.url+"/recovery/share", forged, &map[string]any{}); err == nil || !strings.Contains(err.Error(), "refused at open") {
+		t.Fatalf("share claiming a recipient's key: %v", err)
+	}
+	// A recipient can't take another recipient's slot.
+	if _, err := c.SubmitShare(context.Background(), second.Share, first.Key); err == nil || !strings.Contains(err.Error(), "labelled 2") {
+		t.Fatalf("recipient 1 sent share 2: %v", err)
+	}
+	if got := fresh.status(t)["recovery"].(map[string]any)["pending_shares"]; got != float64(0) {
+		t.Fatalf("pending_shares = %v after junk, want 0", got)
+	}
+	if restored, err := c.SubmitShare(context.Background(), first.Share, first.Key); err != nil || restored {
+		t.Fatalf("first real share: restored=%v, %v", restored, err)
+	}
+	if restored, err := c.SubmitShare(context.Background(), second.Share, second.Key); err != nil || !restored {
+		t.Fatalf("second real share: restored=%v, %v", restored, err)
+	}
+}
+
+func TestOneRecipientCantFloodShares(t *testing.T) {
+	f := newFixture(t, 3, 2)
+	commitment, v := f.bootstrap()
+	bundle, err := f.operatorClient(v, "vault-a").Bundle(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	fresh := f.vault("vault-fresh", "v0.1.1", commitment)
+	c := f.operatorClient(fresh, "vault-fresh")
+	first, second := f.decrypt(t, bundle, 0), f.decrypt(t, bundle, 1)
+	var refused error
+	for range 20 {
+		if _, refused = c.SubmitShare(context.Background(), first.Share, first.Key); refused != nil {
+			break
+		}
+	}
+	if refused == nil || !strings.Contains(refused.Error(), "wait") {
+		t.Fatalf("20 shares from one recipient: %v", refused)
+	}
+	if restored, err := c.SubmitShare(context.Background(), second.Share, second.Key); err != nil || !restored {
+		t.Fatalf("another recipient after the flood: restored=%v, %v", restored, err)
+	}
+}
+
+// sealedShare seals a junk share to the vault while claiming senderRecipient's
+// key, which the sender doesn't hold.
+func sealedShare(t *testing.T, f *fixture, n *node, name, senderRecipient string) vault.SealedRequest {
+	t.Helper()
+	answer, _ := wire.RandomNonce()
+	var begun vault.OperatorBeginResponse
+	if err := wire.PostJSON(context.Background(), http.DefaultClient, n.url+"/operator/begin", vault.OperatorBeginRequest{AnswerNonce: hex.EncodeToString(answer)}, &begun); err != nil {
+		t.Fatal(err)
+	}
+	claimed, err := recovery.RecipientKey(senderRecipient)
+	if err != nil {
+		t.Fatal(err)
+	}
+	vaultKey, _ := wire.ParseRawKey(begun.VaultKey)
+	issued, _ := wire.DecodeNonce(begun.Nonce)
+	ephemeral, _ := ecdh.X25519().GenerateKey(rand.Reader)
+	sealed, err := wire.Seal(wire.PurposeShare, ephemeral, vaultKey, wire.Nonces{Issued: issued, Answer: answer}, []byte{1, 2, 3})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return vault.SealedRequest{Nonce: begun.Nonce, AnswerNonce: hex.EncodeToString(answer), SenderKey: claimed.Bytes(), Sealed: sealed}
 }
 
 func TestStatusReportsASharedMachine(t *testing.T) {
@@ -429,7 +520,8 @@ func TestSharesOfAnotherKeysetDontRestore(t *testing.T) {
 		t.Fatal(err)
 	}
 	fresh := f.vault("vault-fresh", "v0.1.1", commitment)
-	if restored, err := f.operatorClient(fresh, "vault-fresh").SubmitShare(context.Background(), f.decrypt(t, bundle, 0)); err != nil || restored {
+	o := f.decrypt(t, bundle, 0)
+	if restored, err := f.operatorClient(fresh, "vault-fresh").SubmitShare(context.Background(), o.Share, o.Key); err != nil || restored {
 		t.Fatalf("another keyset's share: restored=%v, %v", restored, err)
 	}
 }
@@ -457,7 +549,7 @@ func TestOperatorRefusesUnverifiedVault(t *testing.T) {
 	_, v := f.bootstrap()
 	c := f.operatorClient(v, "vault-a")
 	c.Verify = func(doc, nonce []byte) (*ecdh.PublicKey, error) { return nil, errors.New("wrong release") }
-	if _, err := c.SubmitShare(context.Background(), []byte{1, 2}); err == nil || !strings.Contains(err.Error(), "verifying vault") {
+	if _, err := c.SubmitShare(context.Background(), []byte{1, 2}, f.mustKey(t, 0)); err == nil || !strings.Contains(err.Error(), "verifying vault") {
 		t.Fatalf("submitted to an unverified vault: %v", err)
 	}
 }
@@ -543,10 +635,10 @@ func (f *fixture) nameOf(t *testing.T, n *node) string {
 }
 
 func (f *fixture) decrypt(t *testing.T, b interface {
-	Decrypt([]age.Identity) ([][]byte, error)
-}, i int) []byte {
+	Open([]age.Identity) ([]recovery.Opened, error)
+}, i int) recovery.Opened {
 	t.Helper()
-	shares, err := b.Decrypt([]age.Identity{f.ids[i]})
+	shares, err := b.Open([]age.Identity{f.ids[i]})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -624,7 +716,16 @@ func TestOperatorRefusesKeyNotInDocument(t *testing.T) {
 	ts := httptest.NewServer(mux)
 	t.Cleanup(ts.Close)
 	c := f.operatorClient(&node{url: ts.URL}, "real-vault")
-	if _, err := c.SubmitShare(context.Background(), []byte{1, 2}); err == nil || !strings.Contains(err.Error(), "isn't the one its document endorses") {
+	if _, err := c.SubmitShare(context.Background(), []byte{1, 2}, f.mustKey(t, 0)); err == nil || !strings.Contains(err.Error(), "isn't the one its document endorses") {
 		t.Fatalf("sealed to a key the document doesn't endorse: %v", err)
 	}
+}
+
+func (f *fixture) mustKey(t *testing.T, i int) *ecdh.PrivateKey {
+	t.Helper()
+	k, err := recovery.IdentityKey(f.ids[i])
+	if err != nil {
+		t.Fatal(err)
+	}
+	return k
 }

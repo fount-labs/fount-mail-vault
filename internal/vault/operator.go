@@ -2,9 +2,12 @@ package vault
 
 import (
 	"crypto/ed25519"
+	"crypto/subtle"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net/http"
+	"time"
 
 	"github.com/fount-labs/fount-mail-vault/internal/recovery"
 	"github.com/fount-labs/fount-mail-vault/wire"
@@ -114,8 +117,11 @@ func (s *Server) openSealed(w http.ResponseWriter, req SealedRequest, p wire.Pur
 }
 
 // handleShare collects shares into an empty vault, and installs the keyset once
-// some of them rebuild the committed one. A share proves nothing about who sent
-// it, so the commitment is the only check, and junk shares only cost a retry.
+// some of them rebuild the committed one. A share must be sealed from the key of
+// the recipient whose index it carries, so only a shareholder can fill a slot,
+// and there is one slot per recipient: a later share from the same recipient
+// replaces the earlier one (vault re-review N3). Anyone else is refused before
+// their nonce is spent.
 func (s *Server) handleShare(w http.ResponseWriter, r *http.Request) {
 	var req SealedRequest
 	if !decode(w, r, 1<<16, &req) {
@@ -129,19 +135,38 @@ func (s *Server) handleShare(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusConflict, errHeld)
 		return
 	}
+	slot := s.recipientSlot(req.SenderKey)
+	if slot == 0 {
+		writeError(w, http.StatusForbidden, errors.New("refused at sender: a share must be sealed from a RECOVERY_RECIPIENTS identity"))
+		return
+	}
+	// The recipient keys are public, so only a box that opens, which only the
+	// identity could have sealed, counts against the recipient's budget.
+	if !s.shareTurn(slot, time.Now(), false) {
+		writeError(w, http.StatusTooManyRequests, fmt.Errorf("recipient %d has sent %d shares in %s; wait", slot, maxSharesPerRecipient, nonceLifetime))
+		return
+	}
 	share, ok := s.openSealed(w, req, wire.PurposeShare)
 	if !ok {
 		return
 	}
-	s.mu.Lock()
-	if len(s.pending) >= maxPending {
-		s.mu.Unlock()
+	s.shareTurn(slot, time.Now(), true)
+	if len(share) < 2 || int(share[0]) != slot {
+		label := share0(share)
 		clear(share)
-		writeError(w, http.StatusTooManyRequests, errors.New("too many shares held; redeploy the vault to clear them"))
+		s.refuse(w, "share", fmt.Errorf("recipient %d sent a share labelled %d", slot, label))
 		return
 	}
-	s.pending = append(s.pending, share)
-	pending := append([][]byte(nil), s.pending...)
+	s.mu.Lock()
+	if s.pending == nil {
+		s.pending = make(map[int][]byte)
+	}
+	clear(s.pending[slot])
+	s.pending[slot] = share
+	pending := make([][]byte, 0, len(s.pending))
+	for _, p := range s.pending {
+		pending = append(pending, p)
+	}
 	s.mu.Unlock()
 
 	k, err := recovery.Combine(pending, s.cfg.Threshold, s.cfg.Commitment)
@@ -157,6 +182,46 @@ func (s *Server) handleShare(w http.ResponseWriter, r *http.Request) {
 	s.pending = nil
 	s.mu.Unlock()
 	writeJSON(w, http.StatusOK, map[string]any{"accepted": true, "restored": true, "commitment": k.Commitment()})
+}
+
+// recipientSlot is the share index the sender may fill: one more than its place
+// in RECOVERY_RECIPIENTS, or 0 if it isn't a recipient.
+func (s *Server) recipientSlot(sender []byte) int {
+	for i, k := range s.cfg.RecipientKeys {
+		if subtle.ConstantTimeCompare(k.Bytes(), sender) == 1 {
+			return i + 1
+		}
+	}
+	return 0
+}
+
+// shareTurn reports whether the recipient is within its budget, and with take
+// counts a submission against it. The budget keeps one recipient, even with a
+// stolen identity, from filling spentShare for the rest.
+func (s *Server) shareTurn(slot int, now time.Time, take bool) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.shareTimes == nil {
+		s.shareTimes = make(map[int][]time.Time)
+	}
+	recent := s.shareTimes[slot][:0]
+	for _, t := range s.shareTimes[slot] {
+		if now.Sub(t) < nonceLifetime {
+			recent = append(recent, t)
+		}
+	}
+	if take {
+		recent = append(recent, now)
+	}
+	s.shareTimes[slot] = recent
+	return take || len(recent) < maxSharesPerRecipient
+}
+
+func share0(share []byte) int {
+	if len(share) == 0 {
+		return 0
+	}
+	return int(share[0])
 }
 
 // handleImport replaces the S3 credentials. AWS issues them, so they're the one

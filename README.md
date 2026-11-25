@@ -116,8 +116,11 @@ If both vaults are gone:
    on their own machine, with the network off and the identity's drive mounted. It decrypts,
    then asks you to eject the drive and turn the network on before it connects. It verifies the
    vault before sending anything. `docs/DRILLS.md` §3 has the details.
-3. Once the vault has enough shares that rebuild the committed keyset, it installs it. Junk shares
-   don't stop it.
+3. Once the vault has enough shares that rebuild the committed keyset, it installs it. Each
+   share is sealed from the shareholder's identity, so the vault takes it only from the
+   `RECOVERY_RECIPIENTS` entry whose index it carries, keeps one per recipient, and allows each
+   recipient 8 per 2 minutes. Anyone else's share is refused before it spends anything, so junk
+   can't block a restore.
 4. Import the S3 credentials again, then deploy the other vault, which pulls from the first.
 
 ## Testing
