@@ -33,6 +33,10 @@ type Peer struct {
 	// on the same physical machine.
 	ChipID             string     `json:"chip_id"`
 	FreshnessExpiresAt *time.Time `json:"freshness_expires_at,omitempty"`
+	// TLSKeyFP is the SPKI SHA-256 of the TLS key the document endorses, hex:
+	// the key the enclave's shim serves its hostname with. A copy of the
+	// same release deployed elsewhere has its own.
+	TLSKeyFP string `json:"tls_key_fp,omitempty"`
 }
 
 type Verifier struct{ v *verify.Verifier }
@@ -84,6 +88,9 @@ func (t *Verifier) Verify(doc, nonce []byte, pin string) (*Peer, error) {
 	p := &Peer{Key: key, SendKey: sendKey, KeyFingerprint: wire.Fingerprint(key), Repo: verified.ConfigRepo(), Tag: verified.CodeTag(), ChipID: chip}
 	if sendKey != nil {
 		p.SendKeyFingerprint = wire.Fingerprint(sendKey)
+	}
+	if fp, ok := verified.TLSPublicKeyFP(); ok {
+		p.TLSKeyFP = fp
 	}
 	if exp := verified.FreshnessExpiresAt(); !exp.IsZero() {
 		p.FreshnessExpiresAt = &exp

@@ -46,6 +46,15 @@ const (
 	CounterNoGeneration = "no_generation"
 )
 
+// MaxCount and MaxCountStep bound a swap. The coordinator's security sequence
+// moves by one, so a swap that jumps further is a bug or an attacker; a count
+// at 2^64-1 would leave no successor, and one at 2^63 or more couldn't be
+// written back as COUNT_FLOOR after a total loss (security review M4).
+const (
+	MaxCount     = 1<<63 - 1
+	MaxCountStep = 1 << 20
+)
+
 // MaxCounterBody bounds a counter request or answer.
 const MaxCounterBody = 4 << 10
 
@@ -57,8 +66,16 @@ type CounterRequest struct {
 	Generation uint64 `json:"generation,omitempty"`
 	Prev       uint64 `json:"prev,omitempty"`
 	Next       uint64 `json:"next,omitempty"`
-	// Signature is a cas's, by the generation's key over CASMessage.
+	// Signature is a cas's, by the generation's key over CASMessage, or
+	// CASMessageV2 at version 2.
 	Signature []byte `json:"signature,omitempty"`
+	// Version 2 binds the count to a state (broker review H2): a cas
+	// carries StateDigest, the digest of the coordinator state the new
+	// count counts, and the answer carries the counted state's digest and
+	// the generation that wrote it. 0 is version 1, which a vault that
+	// predates version 2 answers, and which never sees a digest.
+	Version     int    `json:"v,omitempty"`
+	StateDigest string `json:"state_digest,omitempty"` // hex, StateDigestSize bytes
 }
 
 // CounterAnswer is the vault's answer, at 200 for ok and 409 for a refusal.
@@ -66,6 +83,9 @@ type CounterAnswer struct {
 	Result     string `json:"result"`
 	Generation uint64 `json:"generation"`
 	Count      uint64 `json:"count"`
+	// StateDigest and Writer are the counted state's, at version 2.
+	StateDigest string `json:"state_digest,omitempty"`
+	Writer      uint64 `json:"writer,omitempty"`
 	// Signature is the authority's over CounterAnswerMessage.
 	Signature []byte `json:"signature"`
 }
@@ -74,19 +94,44 @@ type CounterAnswer struct {
 type CounterState struct {
 	Generation uint64 `json:"generation"`
 	Count      uint64 `json:"count"`
+	// StateDigest is the digest of the state the count counts, and Writer
+	// the generation whose cas set it: empty and 0 for a count no version
+	// 2 cas has set, such as a register at its floors. Version 2 only. Hex.
+	StateDigest string `json:"state_digest,omitempty"`
+	Writer      uint64 `json:"writer,omitempty"`
 }
 
 const (
-	counterRequestLabel = "fount-coordinator-counter/v1/request\x00"
-	counterCASLabel     = "fount-coordinator-counter/v1/cas\x00"
-	counterAnswerLabel  = "fount-coordinator-counter/v1/answer\x00"
+	counterRequestLabel  = "fount-coordinator-counter/v1/request\x00"
+	counterCASLabel      = "fount-coordinator-counter/v1/cas\x00"
+	counterAnswerLabel   = "fount-coordinator-counter/v1/answer\x00"
+	counterCASLabelV2    = "fount-coordinator-counter/v2/cas\x00"
+	counterAnswerLabelV2 = "fount-coordinator-counter/v2/answer\x00"
 )
+
+// StateDigestSize is a version 2 cas's StateDigest length, before hex.
+const StateDigestSize = 32
+
+// ValidStateDigest is whether d is a state digest: lowercase hex of
+// StateDigestSize bytes.
+func ValidStateDigest(d string) bool {
+	raw, err := hex.DecodeString(d)
+	return err == nil && len(raw) == StateDigestSize && hex.EncodeToString(raw) == d
+}
 
 // Validate checks the shape and returns the nonce.
 func (r *CounterRequest) Validate() ([]byte, error) {
 	nonce, err := DecodeNonce(r.Nonce)
 	if err != nil {
 		return nil, err
+	}
+	switch {
+	case r.Version != 0 && r.Version != 2:
+		return nil, fmt.Errorf("unknown counter version %d", r.Version)
+	case len(r.StateDigest) != 0 && (r.Version != 2 || r.Op != CounterCAS):
+		return nil, errors.New("only a version 2 cas carries a state digest")
+	case r.Version == 2 && r.Op == CounterCAS && !ValidStateDigest(r.StateDigest):
+		return nil, fmt.Errorf("a version 2 cas carries a %d-byte hex state digest", StateDigestSize)
 	}
 	switch r.Op {
 	case CounterLoad:
@@ -96,6 +141,9 @@ func (r *CounterRequest) Validate() ([]byte, error) {
 	case CounterCAS:
 		if r.Generation == 0 || len(r.Signature) != ed25519.SignatureSize {
 			return nil, errors.New("a cas names a generation and is signed")
+		}
+		if r.Next > MaxCount || (r.Next > r.Prev && r.Next-r.Prev > MaxCountStep) {
+			return nil, fmt.Errorf("a cas moves the count by at most %d, to at most %d", MaxCountStep, uint64(MaxCount))
 		}
 	default:
 		return nil, fmt.Errorf("unknown counter op %q", r.Op)
@@ -114,6 +162,11 @@ func (r *CounterRequest) Digest() [32]byte {
 	h.Write(be64(r.Generation))
 	h.Write(be64(r.Prev))
 	h.Write(be64(r.Next))
+	if r.Version == 2 {
+		d, _ := hex.DecodeString(r.StateDigest)
+		h.Write([]byte{2, byte(len(d))})
+		h.Write(d)
+	}
 	var d [32]byte
 	h.Sum(d[:0])
 	return d
@@ -129,6 +182,40 @@ func CASMessage(nonce []byte, generation, prev, next uint64) []byte {
 	return append(msg, be64(next)...)
 }
 
+// CASMessageV2 is CASMessage for a version 2 cas: it signs the state digest
+// too, so nobody between the coordinator and the vault can swap it.
+func CASMessageV2(nonce []byte, generation, prev, next uint64, digest string) []byte {
+	msg := []byte(counterCASLabelV2)
+	msg = append(msg, nonce...)
+	msg = append(msg, be64(generation)...)
+	msg = append(msg, be64(prev)...)
+	msg = append(msg, be64(next)...)
+	d, _ := hex.DecodeString(digest)
+	return append(msg, d...)
+}
+
+// CounterAnswerMessageV2 is CounterAnswerMessage for a version 2 request:
+// the counted state's digest and writer are signed too.
+func CounterAnswerMessageV2(digest [32]byte, result string, st CounterState) []byte {
+	msg := []byte(counterAnswerLabelV2)
+	msg = append(msg, digest[:]...)
+	msg = append(msg, result...)
+	msg = append(msg, 0)
+	msg = append(msg, be64(st.Generation)...)
+	msg = append(msg, be64(st.Count)...)
+	d, _ := hex.DecodeString(st.StateDigest)
+	msg = append(msg, byte(len(d)))
+	msg = append(msg, d...)
+	return append(msg, be64(st.Writer)...)
+}
+
+func answerMessage(r *CounterRequest, result string, st CounterState) []byte {
+	if r.Version == 2 {
+		return CounterAnswerMessageV2(r.Digest(), result, st)
+	}
+	return CounterAnswerMessage(r.Digest(), result, CounterState{Generation: st.Generation, Count: st.Count})
+}
+
 // CounterAnswerMessage is what the authority signs for an answer.
 func CounterAnswerMessage(digest [32]byte, result string, st CounterState) []byte {
 	msg := []byte(counterAnswerLabel)
@@ -139,14 +226,15 @@ func CounterAnswerMessage(digest [32]byte, result string, st CounterState) []byt
 	return append(msg, be64(st.Count)...)
 }
 
-// AnswerCounter signs an answer to r.
+// AnswerCounter signs an answer to r. A version 1 request gets no digest or
+// writer.
 func AnswerCounter(authority ed25519.PrivateKey, r *CounterRequest, result string, st CounterState) CounterAnswer {
-	return CounterAnswer{
-		Result:     result,
-		Generation: st.Generation,
-		Count:      st.Count,
-		Signature:  ed25519.Sign(authority, CounterAnswerMessage(r.Digest(), result, st)),
+	a := CounterAnswer{Result: result, Generation: st.Generation, Count: st.Count}
+	if r.Version == 2 {
+		a.StateDigest, a.Writer = st.StateDigest, st.Writer
 	}
+	a.Signature = ed25519.Sign(authority, answerMessage(r, result, st))
+	return a
 }
 
 func knownResult(r string) bool {
@@ -162,11 +250,23 @@ func VerifyCounterAnswer(authority ed25519.PublicKey, r *CounterRequest, a *Coun
 	if !knownResult(a.Result) {
 		return fmt.Errorf("unknown counter result %q", a.Result)
 	}
-	st := CounterState{Generation: a.Generation, Count: a.Count}
-	if !ed25519.Verify(authority, CounterAnswerMessage(r.Digest(), a.Result, st), a.Signature) {
+	st := a.state(r)
+	if st.StateDigest != "" && !ValidStateDigest(st.StateDigest) {
+		return errors.New("the counter's answer carries a malformed state digest")
+	}
+	if !ed25519.Verify(authority, answerMessage(r, a.Result, st), a.Signature) {
 		return errors.New("the counter's answer isn't signed by the generation authority for this request")
 	}
 	return nil
+}
+
+// state is what a verified answer to r says.
+func (a *CounterAnswer) state(r *CounterRequest) CounterState {
+	st := CounterState{Generation: a.Generation, Count: a.Count}
+	if r.Version == 2 {
+		st.StateDigest, st.Writer = a.StateDigest, a.Writer
+	}
+	return st
 }
 
 func be64(v uint64) []byte { return binary.BigEndian.AppendUint64(nil, v) }
@@ -228,12 +328,52 @@ func (c *CounterClient) CompareAndSwap(ctx context.Context, key ed25519.PrivateK
 	}
 	r := &CounterRequest{Op: CounterCAS, Nonce: hex.EncodeToString(nonce), Generation: generation, Prev: prev, Next: next,
 		Signature: ed25519.Sign(key, CASMessage(nonce, generation, prev, next))}
+	if _, err := r.Validate(); err != nil {
+		return CounterState{}, err
+	}
 	st, err := c.call(ctx, r)
 	if err != nil {
 		return st, err
 	}
 	if st.Generation != generation || st.Count != next {
 		return st, fmt.Errorf("the vault answered ok with generation %d and count %d to a cas to %d under %d", st.Generation, st.Count, next, generation)
+	}
+	return st, nil
+}
+
+// LoadState is Load at version 2: the count, the digest of the state it
+// counts and the generation that wrote it. It needs a vault with version 2;
+// an older one's answer doesn't verify.
+func (c *CounterClient) LoadState(ctx context.Context) (CounterState, error) {
+	nonce, err := RandomNonce()
+	if err != nil {
+		return CounterState{}, err
+	}
+	return c.call(ctx, &CounterRequest{Op: CounterLoad, Nonce: hex.EncodeToString(nonce), Version: 2})
+}
+
+// CompareAndSwapState is CompareAndSwap at version 2: next counts the state
+// whose digest is digest. A retry after a lost answer succeeds only with the
+// same digest.
+func (c *CounterClient) CompareAndSwapState(ctx context.Context, key ed25519.PrivateKey, generation, prev, next uint64, digest string) (CounterState, error) {
+	if len(key) != ed25519.PrivateKeySize {
+		return CounterState{}, errors.New("a cas needs the generation's key")
+	}
+	nonce, err := RandomNonce()
+	if err != nil {
+		return CounterState{}, err
+	}
+	r := &CounterRequest{Op: CounterCAS, Nonce: hex.EncodeToString(nonce), Generation: generation, Prev: prev, Next: next,
+		Version: 2, StateDigest: digest, Signature: ed25519.Sign(key, CASMessageV2(nonce, generation, prev, next, digest))}
+	if _, err := r.Validate(); err != nil {
+		return CounterState{}, err
+	}
+	st, err := c.call(ctx, r)
+	if err != nil {
+		return st, err
+	}
+	if st.Generation != generation || st.Count != next || st.StateDigest != digest || st.Writer != generation {
+		return st, fmt.Errorf("the vault answered ok with generation %d, count %d and another state to a cas to %d under %d", st.Generation, st.Count, next, generation)
 	}
 	return st, nil
 }
@@ -257,7 +397,7 @@ func (c *CounterClient) call(ctx context.Context, r *CounterRequest) (CounterSta
 			errs = append(errs, fmt.Errorf("%s: %w", base, err))
 			continue
 		}
-		st := CounterState{Generation: a.Generation, Count: a.Count}
+		st := a.state(r)
 		if a.Result != CounterOK {
 			return st, &CounterRefusal{Result: a.Result, State: st}
 		}

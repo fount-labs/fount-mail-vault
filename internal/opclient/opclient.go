@@ -53,10 +53,15 @@ func (c *Client) Bundle(ctx context.Context) (*recovery.Bundle, error) {
 	return &b, nil
 }
 
-// SubmitShare sends one decrypted share, sealed to the verified vault. It reports
-// whether the vault has now restored.
-func (c *Client) SubmitShare(ctx context.Context, share []byte) (restored bool, err error) {
-	req, err := c.seal(ctx, wire.PurposeShare, share)
+// SubmitShare sends one decrypted share, sealed to the verified vault from the
+// key of the identity that opened it (recovery.Opened), which is how the vault
+// knows the share is that shareholder's. It reports whether the vault has now
+// restored.
+func (c *Client) SubmitShare(ctx context.Context, share []byte, from *ecdh.PrivateKey) (restored bool, err error) {
+	if from == nil {
+		return false, errors.New("a share must be sealed from its recipient's identity")
+	}
+	req, err := c.seal(ctx, wire.PurposeShare, share, from)
 	if err != nil {
 		return false, err
 	}
@@ -75,7 +80,7 @@ func (c *Client) ImportS3(ctx context.Context, creds wire.S3Credentials, operato
 	if err != nil {
 		return err
 	}
-	sealed, err := c.seal(ctx, wire.PurposeImport, plaintext)
+	sealed, err := c.seal(ctx, wire.PurposeImport, plaintext, nil)
 	clear(plaintext)
 	if err != nil {
 		return err
@@ -85,8 +90,9 @@ func (c *Client) ImportS3(ctx context.Context, creds wire.S3Credentials, operato
 	return wire.PostJSON(ctx, c.HTTP, c.Base+"/operator/import", req, &out)
 }
 
-// seal verifies the vault first, so nothing is sealed to a key no release endorses.
-func (c *Client) seal(ctx context.Context, p wire.Purpose, plaintext []byte) (*vault.SealedRequest, error) {
+// seal verifies the vault first, so nothing is sealed to a key no release
+// endorses. It seals from sender, or from an ephemeral key if that's nil.
+func (c *Client) seal(ctx context.Context, p wire.Purpose, plaintext []byte, sender *ecdh.PrivateKey) (*vault.SealedRequest, error) {
 	if c.Verify == nil {
 		return nil, errors.New("no vault verifier")
 	}
@@ -110,18 +116,19 @@ func (c *Client) seal(ctx context.Context, p wire.Purpose, plaintext []byte) (*v
 	if err != nil {
 		return nil, err
 	}
-	ephemeral, err := ecdh.X25519().GenerateKey(rand.Reader)
-	if err != nil {
-		return nil, err
+	if sender == nil {
+		if sender, err = ecdh.X25519().GenerateKey(rand.Reader); err != nil {
+			return nil, err
+		}
 	}
-	sealed, err := wire.Seal(p, ephemeral, attested, wire.Nonces{Issued: issued, Answer: answer}, plaintext)
+	sealed, err := wire.Seal(p, sender, attested, wire.Nonces{Issued: issued, Answer: answer}, plaintext)
 	if err != nil {
 		return nil, err
 	}
 	return &vault.SealedRequest{
 		Nonce:       begun.Nonce,
 		AnswerNonce: hex.EncodeToString(answer),
-		SenderKey:   ephemeral.PublicKey().Bytes(),
+		SenderKey:   sender.PublicKey().Bytes(),
 		Sealed:      sealed,
 	}, nil
 }

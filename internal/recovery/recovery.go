@@ -4,6 +4,7 @@ package recovery
 
 import (
 	"bytes"
+	"crypto/ecdh"
 	"errors"
 	"fmt"
 	"io"
@@ -113,9 +114,63 @@ func (b *Bundle) Decrypt(identities []age.Identity) ([][]byte, error) {
 	return out, nil
 }
 
-// Combine looks for threshold shares that rebuild the committed keyset. Anyone can
-// submit a share, so it tries each set with distinct indexes, and junk only costs
-// time. The vault caps how many shares it holds, which keeps that bounded.
+// Opened is a share with the identity that opened it, which the shareholder
+// seals it from so the vault knows whose slot it fills.
+type Opened struct {
+	Index int
+	Share []byte
+	Key   *ecdh.PrivateKey
+}
+
+// Open is Decrypt for submitting: it tries each X25519 identity on its own, so
+// it knows which one opened each share.
+func (b *Bundle) Open(identities []age.Identity) ([]Opened, error) {
+	if b.Version != bundleVersion {
+		return nil, fmt.Errorf("bundle version %d, want %d", b.Version, bundleVersion)
+	}
+	var xs []*age.X25519Identity
+	for _, id := range identities {
+		if x, ok := id.(*age.X25519Identity); ok {
+			xs = append(xs, x)
+		}
+	}
+	var out []Opened
+	for _, s := range b.Shares {
+		for _, id := range xs {
+			r, err := age.Decrypt(bytes.NewReader(s.Encrypted), id)
+			if err != nil {
+				var noMatch *age.NoIdentityMatchError
+				if errors.As(err, &noMatch) {
+					continue
+				}
+				return nil, fmt.Errorf("share %d: %w", s.Index, err)
+			}
+			share, err := io.ReadAll(r)
+			if err != nil {
+				return nil, fmt.Errorf("share %d: %w", s.Index, err)
+			}
+			if len(share) == 0 || int(share[0]) != s.Index {
+				clear(share)
+				return nil, fmt.Errorf("share %d is labelled with another index", s.Index)
+			}
+			key, err := IdentityKey(id)
+			if err != nil {
+				clear(share)
+				return nil, fmt.Errorf("share %d: %w", s.Index, err)
+			}
+			out = append(out, Opened{Index: s.Index, Share: share, Key: key})
+			break
+		}
+	}
+	if len(out) == 0 {
+		return nil, errors.New("none of these identities opens a share in the bundle")
+	}
+	return out, nil
+}
+
+// Combine looks for threshold shares that rebuild the committed keyset. It tries
+// each set with distinct indexes, so a wrong share only costs time. The vault
+// holds at most one share per recipient, which keeps that bounded.
 func Combine(shares [][]byte, threshold int, commitment string) (*wire.Keyset, error) {
 	if threshold < 1 || len(shares) < threshold {
 		return nil, fmt.Errorf("have %d shares, need %d", len(shares), threshold)

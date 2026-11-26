@@ -25,7 +25,7 @@ func (s *Server) handleBegin(w http.ResponseWriter, _ *http.Request) {
 		writeError(w, http.StatusTooManyRequests, err)
 		return
 	}
-	writeJSON(w, http.StatusOK, wire.BeginResponse{Nonce: nonce})
+	writeJSON(w, http.StatusOK, wire.BeginResponse{Nonce: nonce, HolderKey: s.transfer.PublicKey().Bytes()})
 }
 
 // handleFinish is the only way the keyset leaves a vault. The channel is
@@ -57,7 +57,8 @@ func (s *Server) handleFinish(w http.ResponseWriter, r *http.Request) {
 		coordinatorKey = req.CoordinatorKey
 		attested = wire.BootNonce(issued, coordinatorKey)
 	}
-	if err := s.consumeNonce(req.Nonce, useTransfer); err != nil {
+	expires, err := s.checkNonce(req.Nonce, useTransfer)
+	if err != nil {
 		s.refuse(w, "nonce", err)
 		return
 	}
@@ -79,6 +80,27 @@ func (s *Server) handleFinish(w http.ResponseWriter, r *http.Request) {
 		s.refuse(w, "boot", errors.New("only a Cloud vault boots a generation, and only for a coordinator"))
 		return
 	}
+	nonces := wire.Nonces{Issued: issued, Answer: answer}
+	// The document says which transfer key is attested, not that the sender
+	// holds it: anyone can fetch a genuine coordinator's document for a nonce
+	// of their choosing. Nothing moves the register until the proof shows
+	// the sender holds that key.
+	class := spentPull
+	if coordinatorKey != nil {
+		if err := wire.VerifyBootProof(s.transfer, peer.Key, nonces, coordinatorKey, req.BootProof); err != nil {
+			s.refuse(w, "boot proof", err)
+			return
+		}
+		if err := s.checkCoordinatorHost(r.Context(), peer); err != nil {
+			s.refuse(w, "coordinator host", err)
+			return
+		}
+		class = spentBoot
+	}
+	if err := s.spend(req.Nonce, expires, class); err != nil {
+		s.refuse(w, "nonce", err)
+		return
+	}
 
 	s.mu.Lock()
 	keyset, s3, send := s.keyset, s.s3, s.sendKeyset
@@ -88,7 +110,6 @@ func (s *Server) handleFinish(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusConflict, errNoKeyset)
 		return
 	}
-	nonces := wire.Nonces{Issued: issued, Answer: answer}
 	p := wire.Payload{Keyset: keyset.MarshalBinary(), S3: s3}
 	// The generation keyset and the register go to vaults only: a
 	// coordinator that held the authority could certify itself.
@@ -101,12 +122,21 @@ func (s *Server) handleFinish(w http.ResponseWriter, r *http.Request) {
 		p.GenerationKeyset, p.Register = gen.MarshalBinary(), history
 	}
 	if coordinatorKey != nil {
+		if err := s.takeBoot(); err != nil {
+			log.Printf("boot for %s %s (%s): %v", peer.Repo, peer.Tag, peer.KeyFingerprint, err)
+			writeError(w, http.StatusTooManyRequests, fmt.Errorf("refused at boot rate: %w", err))
+			return
+		}
 		cert, n, err := s.boot(r.Context(), coordinatorKey)
 		if err != nil {
+			if errors.Is(err, errNothingMoved) {
+				s.refundBoot()
+			}
 			log.Printf("boot for %s %s: %v", peer.Repo, peer.Tag, err)
 			writeError(w, http.StatusServiceUnavailable, fmt.Errorf("booting a generation: %w", err))
 			return
 		}
+		s.recordBoot(peer, n)
 		p.GenerationCertificate = cert
 		log.Printf("coordinator %s %s (%s) booted generation %d", peer.Repo, peer.Tag, peer.KeyFingerprint, n)
 	}

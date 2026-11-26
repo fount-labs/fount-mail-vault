@@ -58,6 +58,7 @@ the mail vault's values:
 - GENERATION_AUTHORITY_KEY: "<base64 public key>" # empty only in the generating release
 - GENERATION_FLOOR: "0"
 - COUNT_FLOOR: "0"
+- COORDINATOR_HOSTS: "<prod coordinator hostname>" # required with GENERATION_AUTHORITY_KEY
 ```
 
 and adds to the shim's paths `/generate-generation`, `/coordinator/counter`,
@@ -89,23 +90,52 @@ hostnames, its own included, through the shim.
 
 ## Booting a generation
 
-The boot rides the existing pull (`wire.PullBoot`), so it has no new
-authentication:
+The boot rides the existing pull (`wire.PullBoot`):
 
 1. The coordinator draws a per-boot Ed25519 key, gets the holder's one-use
-   nonce from `/transfer/begin`, and attests to
-   `sha256("fount-coordinator-boot/v1\x00" ‖ issued nonce ‖ coordinator_key)`
+   nonce and transfer key (`holder_key`) from `/transfer/begin`, and attests
+   to `sha256("fount-coordinator-boot/v1\x00" ‖ issued nonce ‖ coordinator_key)`
    instead of the nonce.
-2. It sends `coordinator_key` on `/transfer/finish`.
+2. It sends `coordinator_key` and `boot_proof` on `/transfer/finish`.
 3. The vault verifies the document against that derived nonce, so the
    document vouches for the key. It refuses a `coordinator_key` from a vault,
    or in a vault without Cloud mode.
-4. The vault proposes the next register state: generation + 1, this key, the
+4. **Proof of possession.** It checks `boot_proof` (below). A document only
+   says which transfer key is attested: the shim serves a genuine
+   coordinator's document for any nonce to anyone, so without the proof
+   anyone could attest the prod coordinator to their own per-boot key and
+   take a generation (security review 2026-11-24, C1).
+5. **The coordinator's host.** It checks that the document's attested TLS
+   key (`crypto_material` id `tls`) is the key one of `COORDINATOR_HOSTS`
+   serves now, over a TLS handshake whose chain verified for that hostname.
+   A copy of the public release deployed in another Tinfoil account is
+   genuine and holds its own keys, but serves another hostname with another
+   TLS key, so it can't boot (vault review H2, broker review H3).
+6. **Rate.** Each vault allows 4 boots at once and one more every 10
+   minutes. A boot refused before it reached either vault (one vault down)
+   is given back. A refused boot is `429 refused at boot rate`; the broker
+   retries with its backoff.
+7. The vault proposes the next register state: generation + 1, this key, the
    count kept (see "Replication"). Only once both vaults hold it does the
    vault sign the certificate and put it in the sealed payload as
    `generation_certificate`, next to the keyset and the S3 credentials.
-5. The coordinator checks the certificate against its own measured authority
+8. The coordinator checks the certificate against its own measured authority
    key, and that it names its key.
+
+`boot_proof` is `HMAC-SHA256(K, "fount-coordinator-boot/v1\x00" ‖
+requester transfer key ‖ holder transfer key ‖ issued nonce ‖ answer nonce ‖
+coordinator_key)`, where `K = HKDF-SHA256(X25519(mine, peer), info =
+"fount-mail-vault/v1/boot-proof\x00")`. The coordinator computes it with its
+transfer key and `holder_key`; the vault with its own and the key the
+document endorses. Only the two attested keys can compute `K`, and the HKDF
+label keeps it apart from the boxes' keys from the same agreement.
+`holder_key` is unauthenticated: a wrong one only makes a proof the vault
+refuses. Someone in the middle can relay a real coordinator's proof, which
+boots a generation for the real coordinator's key, as the real boot would;
+it can't change the key, the nonces or the vault the proof is for. A
+`wire.PullBoot` against a vault that names no `holder_key` sends no proof,
+so a new coordinator still boots at an old vault; a new vault refuses a boot
+without one.
 
 A pull without `coordinator_key` is the plain keyset pull and moves nothing.
 The broker's restore dry run uses it. A retry after a lost answer moves the
@@ -118,8 +148,14 @@ with the signature over `"fount-coordinator-generation/v1\n" ‖ json`.
 
 ## The counter
 
-`POST /coordinator/counter`, through the shim. Bodies are JSON, at most 4 KiB,
-and at most 16 calls run at once (more get 429).
+`POST /coordinator/counter`, through the shim. Bodies are JSON, at most 4 KiB.
+At most 16 swaps run at once (more get 429). Loads are unauthenticated, so
+they don't take those slots: they share settles, at most two at a time, each
+starting after the loads it answers arrived.
+
+A cas moves the count by at most 2^20 and to at most 2^63−1 (`wire.MaxCount`,
+`wire.MaxCountStep`): one swap to 2^64−1 left no successor, and a count at
+2^63 or more couldn't be written back as `COUNT_FLOOR` (review M4).
 
 | Op | Request | Notes |
 |---|---|---|
@@ -151,6 +187,30 @@ count ahead of its own, within its own generation, as its lost answer
 (`backupcommit.go`). The wire client (`wire.CounterClient`) tries each vault
 in order until one gives a signed answer, and checks that an `ok` cas names
 its generation and `next`.
+
+### Version 2: the count counts a state
+
+A version 1 count says how many security changes there were, not which, so
+a fenced generation's disk or backup root at `seq == count` passed (broker
+review H2). A version 2 request has `"v": 2`:
+
+- a cas carries `state_digest`, hex of 32 bytes, the digest of the
+  coordinator state its `next` counts, and signs it:
+  `"fount-coordinator-counter/v2/cas\x00" ‖ nonce ‖ be64(generation) ‖
+  be64(prev) ‖ be64(next) ‖ digest`;
+- the register keeps the digest with the generation whose cas set it
+  (`writer`), and a boot keeps both;
+- the answer carries `state_digest` and `writer`, signed:
+  `"fount-coordinator-counter/v2/answer\x00" ‖ request digest ‖ result ‖
+  0x00 ‖ be64(generation) ‖ be64(count) ‖ len ‖ digest ‖ be64(writer)`, where
+  the request digest appends `0x02 ‖ len ‖ digest` at version 2;
+- a retry of the last swap must name the same digest.
+
+Version 1 requests are answered exactly as before, and register states no
+version 2 cas made hash as before, so mixed vault releases agree until a
+coordinator sends version 2. `wire.CounterClient.LoadState` and
+`CompareAndSwapState` speak it. What the digest covers, and what the
+coordinator does when its disk or a root doesn't match, is fount-broker's.
 
 ## Replication
 
@@ -279,12 +339,97 @@ close the gap: whoever holds the bucket can replay an older version.
 | Measured release configs (public) | The keyset commitment, the authority public key (vault, edge, coordinator), the floors |
 | The edge | The authority public key, and the highest generation it has seen |
 
+## Nonces
+
+`/transfer/begin` and `/operator/begin` are unauthenticated, and used to
+share one pool of 256 open nonces, so anyone could stop every restore, boot
+and import (review H1). Now a nonce is `use (1) ‖ expiry, Unix ms (8) ‖
+random (7) ‖ HMAC (16)` under a per-process key: issuing keeps nothing. A
+nonce is spent only once its exchange proved itself, into a set per class:
+
+| Class | Spent after | When full |
+|---|---|---|
+| pull | the document verifies | evicts its oldest: a pull has no side effect, and its box opens only with the attested key |
+| boot | the boot proof verifies | refuses (boots are rate-limited, so it never fills) |
+| share | the share box opens | refuses |
+| import | the operator's signature verifies and the box opens | refuses |
+
+A nonce from a vault that restarted since is unknown; the caller begins
+again.
+
+## Monitoring
+
+`/status` → `coordinator`:
+
+- `boots`: `count`, `rate_limited`, `wrong_host`, `allowance`, and the last
+  boot's `last_at`, `last_generation`, `last_repo`, `last_tag`,
+  `last_chip_id`, `last_transfer_key_fp`, `last_tls_key_fp`. Alert on every
+  change of `count` or `register.generation` that isn't a deploy you made,
+  on any `wrong_host` or `rate_limited`, and when the two vaults'
+  `register` heads differ for more than a minute.
+- `coordinator_hosts`: the hostnames a boot must come from.
+
+`/status` is unauthenticated and its `last_peer` and `refusals` can be set by
+anyone replaying public documents (review L3), so treat it as a signal, not
+proof.
+
+## Runbook: who may boot, and retiring releases
+
+- `COORDINATOR_HOSTS` is required with `GENERATION_AUTHORITY_KEY`. Set it to
+  the prod coordinator's hostname(s) exactly. Before a release with it, check
+  live that the coordinator's attestation document lists a `tls` key in
+  `crypto_material` and that `openssl s_client -connect <host>:443` shows a
+  leaf whose SPKI SHA-256 matches; if the document has no `tls` key, every
+  boot fails closed with `endorses no TLS key`.
+- A boot needs the hostname to route to the booting enclave. During a
+  coordinator update the old instance may still answer for a moment; the
+  boot is refused `refused at coordinator host` and the coordinator's
+  backoff retries.
+- **Raise `EDGE_MIN_TAG` past every restore release.** A coordinator
+  release cut with `--restore latest`, `--restore roots/…` or
+  `--restore-dry-run` in its measured args stays deployable by anyone for as
+  long as its tag is ≥ `EDGE_MIN_TAG`. The host pin stops such a copy
+  booting, but it still gets the keyset and the S3 credentials by a plain
+  pull, and on Fount's own host it would restore again. So: cut restore
+  releases only while a restore is in progress; afterwards release the
+  Cloud vault with `EDGE_MIN_TAG` above every restore and restore-dry-run
+  tag, and above every coordinator tag that predates the boot proof. Never
+  tag a restore release at or above the live minimum except during a
+  restore.
+- After a drill or a restore, confirm on both vaults' `/status` that
+  `edge_min_tag` is the new floor and `boots.count` moved only for the boots
+  you made.
+- A boot at a vault that's at its rate limit waits up to 10 minutes. Don't
+  restart a vault to reset it: a vault restart during a flood or an outage
+  is what loses the generation keyset.
+
+## Ship order (2026-11-24 fixes)
+
+1. Merge this repo's wire changes. The broker bumps
+   `github.com/fount-labs/fount-mail-vault/wire` and releases a coordinator
+   that sends the boot proof (it still boots at an old vault, which names
+   no `holder_key`).
+2. Release the Cloud vault pair (both vaults, held then promoted) with the
+   boot proof, `COORDINATOR_HOSTS`, and `EDGE_MIN_TAG` at that coordinator
+   release, so older coordinators, which can't prove, and old restore
+   releases are refused at the minimum tag.
+3. Only then turn on counter version 2 at the coordinator,
+   `--counter-states` (`FOUNT_COORDINATOR_COUNTER_STATES=1`), built in
+   fount-broker `fix/vault-boot` (a vault before step 2 can't answer it,
+   and a vault mid-upgrade would hash the digest differently).
+
 ## Broker side
 
 - `vaultkey.Fetch` boots: it sends a fresh `coordinator_key` and keeps the
   certificate, the generation key and the S3 credentials.
 - `vaultcounter` implements `coordinator.VaultCounter` with
   `wire.CounterClient`.
+- The generation waits for the volume (fount-broker `fix/vault-boot`):
+  the keyset pull boots nothing, and once the volume is open the
+  coordinator boots only when its security sequence has reached the count,
+  the count is 0, or `--restore` targets an empty volume. Otherwise it
+  reports `refused` on `/status` and fences nobody. A retired coordinator
+  fails `/health`. Every restore moves the count one past the root's.
 - `--wrapping-key vault` takes `--backup-bucket` once
   `--coordinator-authority-key` is set. It uses the bucket credentials from
   the vault (`vaultctl import-s3`), not the environment.
@@ -296,3 +441,6 @@ close the gap: whoever holds the bucket can replay an older version.
   in flight.
 - Kill one vault for a while: everything refuses, and nothing forks.
 - Total loss with floors, on a scratch pair.
+- The 2026-11-24 negatives: a boot with a public document and no proof; a
+  copy of the coordinator release on another hostname; a begin and load
+  flood during a vault restart; a fifth boot inside ten minutes.

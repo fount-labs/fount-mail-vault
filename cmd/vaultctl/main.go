@@ -217,13 +217,13 @@ func submitShare(parent context.Context, c *opclient.Client, path string, identi
 	if err != nil {
 		return err
 	}
-	shares, err := b.Decrypt(ids)
+	shares, err := b.Open(ids)
 	if err != nil {
 		return err
 	}
 	defer func() {
-		for _, share := range shares {
-			clear(share)
+		for _, o := range shares {
+			clear(o.Share)
 		}
 	}()
 	if gate != nil {
@@ -233,9 +233,9 @@ func submitShare(parent context.Context, c *opclient.Client, path string, identi
 	}
 	ctx, cancel := context.WithTimeout(parent, 3*time.Minute)
 	defer cancel()
-	for _, share := range shares {
-		restored, err := c.SubmitShare(ctx, share)
-		clear(share)
+	for _, o := range shares {
+		restored, err := c.SubmitShare(ctx, o.Share, o.Key)
+		clear(o.Share)
 		if err != nil {
 			return err
 		}

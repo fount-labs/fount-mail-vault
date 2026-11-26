@@ -14,7 +14,10 @@ import (
 
 // The Cloud vault's generation and counter (docs/COORDINATOR-COUNTER.md).
 
-const maxCounterCalls = 16
+const (
+	maxCounterCalls   = 16
+	loadSettleTimeout = 30 * time.Second
+)
 
 var errNotCloud = errors.New("this vault isn't a Cloud vault (COORDINATOR_MODE)")
 
@@ -117,7 +120,8 @@ func (s *Server) boot(ctx context.Context, key ed25519.PublicKey) (string, uint6
 		return "", 0, err
 	}
 	committed, err := s.propose(ctx, func(head regState) (*regState, error) {
-		return &regState{Version: head.Version + 1, Prev: head.hash(), Generation: head.Generation + 1, Key: key, Count: head.Count}, nil
+		return &regState{Version: head.Version + 1, Prev: head.hash(), Generation: head.Generation + 1, Key: key, Count: head.Count,
+			Digest: head.Digest, Writer: head.Writer}, nil
 	})
 	if err != nil {
 		return "", 0, err
@@ -140,13 +144,6 @@ func (s *Server) handleCounter(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusConflict, err)
 		return
 	}
-	select {
-	case s.counterCalls <- struct{}{}:
-		defer func() { <-s.counterCalls }()
-	default:
-		writeError(w, http.StatusTooManyRequests, errTooMany)
-		return
-	}
 	var req wire.CounterRequest
 	if !decode(w, r, wire.MaxCounterBody, &req) {
 		return
@@ -156,37 +153,55 @@ func (s *Server) handleCounter(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, err)
 		return
 	}
+	// A load is unauthenticated, so loads share settles rather than slots:
+	// a flood of them can't take the slots a swap needs (review L4).
+	if req.Op == wire.CounterCAS {
+		select {
+		case s.counterCalls <- struct{}{}:
+			defer func() { <-s.counterCalls }()
+		default:
+			writeError(w, http.StatusTooManyRequests, errTooMany)
+			return
+		}
+	}
 	var (
 		result string
 		st     wire.CounterState
 	)
 	switch req.Op {
 	case wire.CounterLoad:
-		head, _, err := s.settle(r.Context())
+		head, err := s.sharedSettle(r.Context())
 		if err != nil {
 			s.unavailable(w, err)
 			return
 		}
-		result, st = wire.CounterOK, wire.CounterState{Generation: head.Generation, Count: head.Count}
+		result, st = wire.CounterOK, head.counterState()
 	case wire.CounterCAS:
 		_, err := s.propose(r.Context(), func(head regState) (*regState, error) {
-			st = wire.CounterState{Generation: head.Generation, Count: head.Count}
+			st = head.counterState()
+			msg := wire.CASMessage(nonce, req.Generation, req.Prev, req.Next)
+			var writer uint64
+			if req.Version == 2 {
+				msg, writer = wire.CASMessageV2(nonce, req.Generation, req.Prev, req.Next, req.StateDigest), req.Generation
+			}
 			switch {
 			case req.Generation != head.Generation:
 				result = wire.CounterStaleGeneration
 			case len(head.Key) != ed25519.PublicKeySize:
 				result = wire.CounterNoGeneration
-			case !ed25519.Verify(head.Key, wire.CASMessage(nonce, req.Generation, req.Prev, req.Next), req.Signature):
+			case !ed25519.Verify(head.Key, msg, req.Signature):
 				result = wire.CounterBadSignature
-			case head.Count == req.Next && head.Swap != nil && *head.Swap == (regSwap{req.Generation, req.Prev, req.Next}):
+			case head.Count == req.Next && head.Swap != nil && *head.Swap == (regSwap{req.Generation, req.Prev, req.Next}) &&
+				head.Digest == req.StateDigest && head.Writer == writer:
 				// A retry after a lost answer: this swap is the last one made.
 				result = wire.CounterOK
 			case head.Count != req.Prev || req.Next <= req.Prev:
 				result = wire.CounterCountMismatch
 			default:
-				result, st.Count = wire.CounterOK, req.Next
-				return &regState{Version: head.Version + 1, Prev: head.hash(), Generation: head.Generation, Key: head.Key,
-					Count: req.Next, Swap: &regSwap{req.Generation, req.Prev, req.Next}}, nil
+				n := &regState{Version: head.Version + 1, Prev: head.hash(), Generation: head.Generation, Key: head.Key,
+					Count: req.Next, Swap: &regSwap{req.Generation, req.Prev, req.Next}, Digest: req.StateDigest, Writer: writer}
+				result, st = wire.CounterOK, n.counterState()
+				return n, nil
 			}
 			return nil, nil
 		})
@@ -200,6 +215,57 @@ func (s *Server) handleCounter(w http.ResponseWriter, r *http.Request) {
 		status = http.StatusConflict
 	}
 	writeJSON(w, status, wire.AnswerCounter(g.Authority(), &req, result, st))
+}
+
+// loadFlight is one settle that loads share.
+type loadFlight struct {
+	done chan struct{}
+	head regState
+	err  error
+}
+
+// sharedSettle is settle for a load. Every load that arrives while a settle
+// runs waits for the next one, which starts after they all arrived, so each
+// still sees a head at least as new as its own arrival; at most two settles
+// for loads run at once, however many loads come.
+func (s *Server) sharedSettle(ctx context.Context) (regState, error) {
+	s.loadMu.Lock()
+	if s.loadNext == nil {
+		s.loadNext = &loadFlight{done: make(chan struct{})}
+	}
+	f := s.loadNext
+	if !s.loadRunning {
+		s.startLoadLocked()
+	}
+	s.loadMu.Unlock()
+	select {
+	case <-f.done:
+		return f.head, f.err
+	case <-ctx.Done():
+		return regState{}, ctx.Err()
+	}
+}
+
+// startLoadLocked runs loadNext. Called with loadMu held.
+func (s *Server) startLoadLocked() {
+	f := s.loadNext
+	s.loadNext, s.loadRunning = nil, true
+	go func() {
+		ctx, cancel := context.WithTimeout(context.Background(), loadSettleTimeout)
+		f.head, _, f.err = s.settle(ctx)
+		cancel()
+		close(f.done)
+		s.loadMu.Lock()
+		s.loadRunning = false
+		if s.loadNext != nil {
+			s.startLoadLocked()
+		}
+		s.loadMu.Unlock()
+	}()
+}
+
+func (h regState) counterState() wire.CounterState {
+	return wire.CounterState{Generation: h.Generation, Count: h.Count, StateDigest: h.Digest, Writer: h.Writer}
 }
 
 func (s *Server) unavailable(w http.ResponseWriter, err error) {

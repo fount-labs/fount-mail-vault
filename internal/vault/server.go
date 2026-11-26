@@ -3,7 +3,10 @@ package vault
 import (
 	"context"
 	"crypto/ecdh"
+	"crypto/hmac"
 	"crypto/rand"
+	"crypto/sha256"
+	"encoding/binary"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -20,12 +23,15 @@ import (
 
 const (
 	nonceLifetime  = 2 * time.Minute
-	maxNonces      = 256
+	maxSpentPulls  = 1 << 14
+	maxSpentStrict = 1 << 12
 	maxRefusals    = 20
-	maxPending     = 32
-	selfCheckEvery = time.Hour
-	retryFirst     = 5 * time.Second
-	retryMax       = 2 * time.Minute
+	// maxSharesPerRecipient is how many shares one recipient may submit per
+	// nonce lifetime, so even a stolen identity can't fill spentShare.
+	maxSharesPerRecipient = 8
+	selfCheckEvery        = time.Hour
+	retryFirst            = 5 * time.Second
+	retryMax              = 2 * time.Minute
 )
 
 var (
@@ -54,10 +60,25 @@ const (
 	useOperator nonceUse = "operator"
 )
 
-type issuedNonce struct {
-	use     nonceUse
-	expires time.Time
-}
+// nonceUseByte is a nonce's first byte, so a nonce says what it was issued for.
+var nonceUseByte = map[nonceUse]byte{useTransfer: 1, useOperator: 2}
+
+// spentClass is where a consumed nonce is kept until it expires. Each class
+// has its own budget, so a flood of one can't refuse another.
+type spentClass string
+
+const (
+	// spentPull is a pull's: it has no side effect, and the box is sealed to
+	// the attested key, so replaying an evicted one gives nobody anything.
+	// The oldest is evicted when it's full.
+	spentPull spentClass = "pull"
+	// spentBoot, spentShare and spentImport have side effects, and are kept
+	// until they expire. Only a boot proof, an opened share box or an
+	// operator signature gets a nonce into one.
+	spentBoot   spentClass = "boot"
+	spentShare  spentClass = "share"
+	spentImport spentClass = "import"
+)
 
 type refusal struct {
 	At     time.Time `json:"at"`
@@ -84,14 +105,21 @@ type Server struct {
 	source      string
 	sendKeyset  *wire.SendKeyset
 	sendSource  string
-	nonces      map[string]issuedNonce
+	nonceKey    []byte
+	spent       map[spentClass]*spentSet
 	refusals    []refusal
 	lastPeer    *peerRecord
 	self        *attest.Peer
 	selfErr     string
 	selfChecked time.Time
 	bundle      *recovery.Bundle
-	pending     [][]byte
+	// pending holds at most one share per recipient, keyed by its index, and
+	// shareTimes when each recipient last submitted (maxSharesPerRecipient).
+	pending    map[int][]byte
+	shareTimes map[int][]time.Time
+	// beforeCombine, set by tests only, runs as a restore attempt begins,
+	// outside the lock.
+	beforeCombine func()
 
 	// The Cloud vault's generation keyset and register (counter.go,
 	// register.go). instance is drawn per process.
@@ -103,26 +131,44 @@ type Server struct {
 	instance     string
 	proposeMu    sync.Mutex
 	counterCalls chan struct{}
+	loadMu       sync.Mutex
+	loadNext     *loadFlight
+	loadRunning  bool
 	peerBase     func(host string) string
+	boots        bootStats
+	// servingKey is the TLS key a coordinator host serves; tests replace it.
+	servingKey func(ctx context.Context, host string) (string, error)
 }
 
 func NewServer(cfg *Config, transfer *ecdh.PrivateKey, a wire.Attester, v Verifier, client *http.Client) *Server {
 	instance := make([]byte, 16)
+	nonceKey := make([]byte, 32)
 	if _, err := rand.Read(instance); err != nil {
 		panic(err)
 	}
-	return &Server{
-		cfg:          cfg,
-		transfer:     transfer,
-		attester:     a,
-		verifier:     v,
-		client:       client,
-		booted:       time.Now(),
-		nonces:       make(map[string]issuedNonce),
+	if _, err := rand.Read(nonceKey); err != nil {
+		panic(err)
+	}
+	s := &Server{
+		cfg:      cfg,
+		transfer: transfer,
+		attester: a,
+		verifier: v,
+		client:   client,
+		booted:   time.Now(),
+		nonceKey: nonceKey,
+		spent: map[spentClass]*spentSet{
+			spentPull:   newSpentSet(maxSpentPulls, true),
+			spentBoot:   newSpentSet(maxSpentStrict, false),
+			spentShare:  newSpentSet(maxSpentStrict, false),
+			spentImport: newSpentSet(maxSpentStrict, false),
+		},
 		instance:     hex.EncodeToString(instance),
 		counterCalls: make(chan struct{}, maxCounterCalls),
 		peerBase:     func(host string) string { return "https://" + host },
 	}
+	s.servingKey = tlsKeyServing(client, func(host string) string { return s.peerBase(host) })
+	return s
 }
 
 func (s *Server) Routes() http.Handler {
@@ -370,6 +416,8 @@ func (s *Server) handleStatus(w http.ResponseWriter, _ *http.Request) {
 			"generation_source":    s.genSource,
 			"instance":             s.instance,
 			"last_sync":            s.lastSync,
+			"coordinator_hosts":    s.cfg.CoordinatorHosts,
+			"boots":                s.boots,
 		}
 		if s.genKeyset != nil {
 			cloud["authority_key"] = s.genKeyset.AuthorityKey()
@@ -427,6 +475,10 @@ func (s *Server) handleGenerate(w http.ResponseWriter, _ *http.Request) {
 // for the same reason as handleGenerate. The keyset commitment is what keeps it
 // apart from the first generate: the send keyset rides with the committed keyset.
 func (s *Server) handleGenerateSend(w http.ResponseWriter, _ *http.Request) {
+	if s.cfg.CoordinatorMode {
+		writeError(w, http.StatusConflict, errors.New("a Cloud vault holds no send keyset"))
+		return
+	}
 	if s.cfg.SendCommitment != "" {
 		writeError(w, http.StatusConflict, errNoSendSlot)
 		return
@@ -481,46 +533,92 @@ func (s *Server) handleBundle(w http.ResponseWriter, _ *http.Request) {
 	writeJSON(w, http.StatusOK, s.bundle)
 }
 
-// issueNonce makes a one-use nonce for one kind of exchange.
+// issueNonce makes a nonce for one kind of exchange. It keeps nothing: the
+// nonce carries its use and expiry under a MAC with this process's key, so
+// nobody can run the vault out of nonces (security review H1). Single use is
+// spend's, once the exchange has shown what it is.
+//
+// Layout: use (1) | expiry, Unix ms (8) | random (7) | MAC (16).
 func (s *Server) issueNonce(use nonceUse) (string, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	now := time.Now()
-	for n, issued := range s.nonces {
-		if now.After(issued.expires) {
-			delete(s.nonces, n)
-		}
-	}
-	if len(s.nonces) >= maxNonces {
-		return "", errTooMany
-	}
-	nonce, err := wire.RandomNonce()
-	if err != nil {
+	nonce := make([]byte, wire.NonceSize)
+	nonce[0] = nonceUseByte[use]
+	binary.BigEndian.PutUint64(nonce[1:9], uint64(time.Now().Add(nonceLifetime).UnixMilli()))
+	if _, err := rand.Read(nonce[9:16]); err != nil {
 		return "", err
 	}
-	encoded := hex.EncodeToString(nonce)
-	s.nonces[encoded] = issuedNonce{use: use, expires: now.Add(nonceLifetime)}
-	return encoded, nil
+	copy(nonce[16:], s.nonceMAC(nonce[:16]))
+	return hex.EncodeToString(nonce), nil
+}
+
+func (s *Server) nonceMAC(body []byte) []byte {
+	m := hmac.New(sha256.New, s.nonceKey)
+	m.Write([]byte("fount-mail-vault/nonce/v1\x00"))
+	m.Write(body)
+	return m.Sum(nil)[:16]
+}
+
+// checkNonce is whether this process issued the nonce, for use, and it hasn't
+// expired. It doesn't spend it.
+func (s *Server) checkNonce(encoded string, use nonceUse) (time.Time, error) {
+	nonce, err := hex.DecodeString(encoded)
+	if err != nil || len(nonce) != wire.NonceSize || !hmac.Equal(s.nonceMAC(nonce[:16]), nonce[16:]) {
+		return time.Time{}, errors.New("unknown nonce: this vault didn't issue it, or it restarted since")
+	}
+	if nonce[0] != nonceUseByte[use] {
+		for other, b := range nonceUseByte {
+			if b == nonce[0] {
+				return time.Time{}, fmt.Errorf("nonce was issued for %s, not %s", other, use)
+			}
+		}
+	}
+	expires := time.UnixMilli(int64(binary.BigEndian.Uint64(nonce[1:9])))
+	if time.Now().After(expires) {
+		return time.Time{}, errors.New("expired nonce")
+	}
+	return expires, nil
+}
+
+// spend makes a checked nonce single-use within its class. It comes after
+// whatever proves the exchange, so a request that proves nothing spends
+// nothing, and a flood of pulls can't fill the sets boots and the operator
+// use.
+func (s *Server) spend(encoded string, expires time.Time, class spentClass) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.spent[class].add(encoded, expires, time.Now())
 }
 
 var errTooMany = errors.New("too many open exchanges")
 
-// consumeNonce makes each challenge single-use, so a document or a signed request
-// for it can't be replayed, even by someone who saw the first exchange.
-func (s *Server) consumeNonce(encoded string, use nonceUse) error {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	issued, ok := s.nonces[encoded]
-	if !ok {
-		return errors.New("unknown or already used nonce")
+// spentSet is the nonces of one class spent and not yet expired, oldest first.
+type spentSet struct {
+	max   int
+	evict bool
+	at    map[string]time.Time
+	order []string
+}
+
+func newSpentSet(max int, evict bool) *spentSet {
+	return &spentSet{max: max, evict: evict, at: map[string]time.Time{}}
+}
+
+func (p *spentSet) add(nonce string, expires, now time.Time) error {
+	if _, ok := p.at[nonce]; ok {
+		return errors.New("already used nonce")
 	}
-	delete(s.nonces, encoded)
-	if issued.use != use {
-		return fmt.Errorf("nonce was issued for %s, not %s", issued.use, use)
+	for len(p.order) > 0 {
+		oldest := p.order[0]
+		if exp, ok := p.at[oldest]; ok && now.Before(exp) && len(p.at) < p.max {
+			break
+		}
+		if exp, ok := p.at[oldest]; ok && now.Before(exp) && !p.evict {
+			return errTooMany
+		}
+		delete(p.at, oldest)
+		p.order = p.order[1:]
 	}
-	if time.Now().After(issued.expires) {
-		return errors.New("expired nonce")
-	}
+	p.at[nonce] = expires
+	p.order = append(p.order, nonce)
 	return nil
 }
 

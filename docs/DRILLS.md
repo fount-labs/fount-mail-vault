@@ -145,12 +145,19 @@ or the run fails. An offline seal doesn't fit instead, because the `/operator/be
 lasts two minutes.
 
 `-offline-first` doesn't check that the network is really off. Check that yourself before you
-mount the drive. The parsed identity is held by the age library, which gives no way to zero
-it, so it stays in memory until vaultctl exits, which it does as soon as the share is sent.
+mount the drive.
 
-At threshold 1 the share is the whole keyset, so it's still in memory while the laptop is
-online. What the flag protects is the identity, which opens every future bundle made for
-the same recipients.
+What the flag keeps offline is the drive, not the identity's key. Since a share must be sealed
+from its recipient's own identity (the vault refuses any other sender), the identity's X25519
+key is used online, after Enter, to seal each share. It is held in an `ecdh.PrivateKey`, and
+the parsed identity by the age library; Go gives no way to zero either, so both stay in
+memory until vaultctl exits, which it does as soon as the shares are sent. At threshold 1 the
+share is the whole keyset, and it too is in memory while the laptop is online.
+
+So a laptop that is compromised while online can take the identity, which opens every future
+bundle made for the same recipients, as well as the share. Run the drill and a real recovery
+on a laptop you trust, freshly booted. If you doubt it afterwards, treat the identity as
+exposed: make new recipient identities and a new bundle (`docs/KEYS.md`).
 
 ### Steps
 
@@ -176,8 +183,10 @@ Owner actions, in order:
 6. Straight away: `tinfoil container stop vault-drill`, then
    `tinfoil container delete vault-drill`. Then archive the drill repo.
 
-This drill doesn't cover "junk shares don't stop it". Only the unit tests do, since no tool
-makes a junk share that opens with a real identity.
+This drill doesn't cover "junk shares don't stop it". Only the unit tests do
+(`TestProbeJunkSharesBlockRestore`, `TestOneRecipientCantFloodShares`): a share sealed from
+anything but a recipient's identity is refused at `sender`, and one recipient can fill only
+its own slot.
 
 ## 4. Routing restore
 

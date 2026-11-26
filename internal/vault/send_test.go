@@ -271,7 +271,8 @@ func TestRecoveryLeavesTheSendKeysetToPeers(t *testing.T) {
 		t.Fatalf("bundle is for %s, want the keyset %s", bundle.Commitment, commitment)
 	}
 	fresh := f.vaultWith("vault-fresh", tagSend, commitment, send, http.DefaultClient)
-	if restored, err := f.operatorClient(fresh, "vault-fresh").SubmitShare(context.Background(), f.decrypt(t, bundle, 0)); err != nil || !restored {
+	o := f.decrypt(t, bundle, 0)
+	if restored, err := f.operatorClient(fresh, "vault-fresh").SubmitShare(context.Background(), o.Share, o.Key); err != nil || !restored {
 		t.Fatalf("restore: %v, %v", restored, err)
 	}
 	if st := fresh.status(t); st["has_keyset"] != true || st["has_send_keyset"] != false {

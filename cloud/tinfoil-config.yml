@@ -48,6 +48,7 @@ containers:
       - GENERATION_AUTHORITY_KEY: "" # empty only in the release that runs /generate-generation; then the edge's COORDINATOR_AUTHORITY_KEY
       - GENERATION_FLOOR: "0" # a first register; after a total loss, at least the edge's highest generation
       - COUNT_FLOOR: "0" # a first register; after a total loss, at least the newest backup's security sequence
+      - COORDINATOR_HOSTS: "PLACEHOLDER_COORDINATOR_HOST" # the prod coordinator's hostname(s), e.g. <name>.fount.containers.tinfoil.dev: a boot is only for the enclave whose attested TLS key serves one; required with GENERATION_AUTHORITY_KEY
 
 shim:
   upstream-port: 8080
@@ -55,7 +56,6 @@ shim:
     - /health
     - /status
     - /generate
-    - /generate-send
     - /transfer/begin
     - /transfer/finish
     - /recovery/bundle
